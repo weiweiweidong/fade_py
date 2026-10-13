@@ -1,866 +1,624 @@
-# FADE 技术文档
+# FADE 技术文档：论文、算法与 Python 实现
 
-> **FADE — Fog Aware Density Evaluator**
-> 无参考图像的感知雾浓度与图像质量预测算法
->
-> 原始论文：Choi, L. K., You, J., & Bovik, A. C. (2015).
-> _Referenceless prediction of perceptual fog density and perceptual image quality._
-> IEEE Transactions on Image Processing, 24(11), 3888–3901.
+[简体中文](technical_documentation.md) | [English](technical_documentation_EN.md) | [日本語](technical_documentation_JA.md)
 
----
+本文面向论文复现研究者，以仓库中的论文 PDF 和当前源码为依据。**论文依据**说明作者的定义与实验；**程序事实**描述本项目实际执行的计算；**解释**用于连接数学、感知意义和代码，不构成独立实验结论。核对的代码基线为 `50643c5`。
 
 ## 目录
 
-1. [项目概述](#1-项目概述)
-2. [整体架构](#2-整体架构)
-3. [模块功能说明](#3-模块功能说明)
-   - [公共 API 层](#31-公共-api-层--apipypipy)
-   - [流水线层](#32-流水线层--pipelinepy)
-   - [特征模块层](#33-特征模块层--features)
-   - [底层算子层](#34-底层算子层--ops)
-   - [数据模型层](#35-数据模型层--models)
-   - [参考数据](#36-参考数据--data)
-4. [FADE 算法中的 12 个特征量](#4-fade-算法中的-12-个特征量)
-   - [预处理与通用中间量](#预处理与通用中间量)
-   - [特征 f01：MSCN 块方差](#特征-f01mscn-块方差)
-   - [特征 f02：垂直 MSCN 乘积正值方差](#特征-f02垂直-mscn-乘积正值方差)
-   - [特征 f03：垂直 MSCN 乘积负值方差](#特征-f03垂直-mscn-乘积负值方差)
-   - [特征 f04：局部标准差均值](#特征-f04局部标准差均值)
-   - [特征 f05：变异系数均值](#特征-f05变异系数均值)
-   - [特征 f06：灰度对比度能量均值](#特征-f06灰度对比度能量均值)
-   - [特征 f07：蓝-黄通道对比度能量均值](#特征-f07蓝-黄通道对比度能量均值)
-   - [特征 f08：红-绿通道对比度能量均值](#特征-f08红-绿通道对比度能量均值)
-   - [特征 f09：图像块熵](#特征-f09图像块熵)
-   - [特征 f10：暗通道均值](#特征-f10暗通道均值)
-   - [特征 f11：色饱和度均值](#特征-f11色饱和度均值)
-   - [特征 f12：色彩丰富度](#特征-f12色彩丰富度)
-5. [评分计算：Mahalanobis 距离与 FADE 分数](#5-评分计算mahalanobis-距离与-fade-分数)
-6. [性能优化要点](#6-性能优化要点)
-
----
-
-## 1. 项目概述
-
-FADE 是一种**无参考（No-Reference）**图像雾浓度评估算法。给定一张 RGB 图像，无需配对的无雾版本，算法即可输出一个标量分数，分数越高表示图像中雾越浓。
-
-核心思路：从图像中提取 12 个感知特征，构成每个图像块的特征向量，再分别计算该向量与预先训练好的**无雾分布**和**有雾分布**之间的 Mahalanobis 距离，最终通过比值得到 FADE 分数。
-
-**输入：** RGB 图像，`np.ndarray`，形状 `(H, W, 3)`，`dtype=uint8`
-
-**输出：**
-
-- `fade(I) → float`：标量雾浓度分数
-- `fade_with_map(I) → (float, np.ndarray)`：标量分数 + 逐块密度图，图形状为 `(H//8, W//8)`
-
----
-
-## 2. 整体架构
+1. [论文介绍](#paper)
+2. [符号与整体流程](#flow)
+3. [预处理与 12 个特征](#features)
+4. [参考统计与评分](#score)
+5. [程序实现](#implementation)
+6. [论文与实现对照](#comparison)
+7. [样例、测试与限制](#validation)
+8. [优化与参考资料](#references)
 
-```
-fade_py/
-├── src/fade/
-│   ├── __init__.py         # 对外暴露 fade / fade_with_map
-│   ├── api.py              # 公共 API 入口，委托给 FadePipeline
-│   ├── pipeline.py         # 流水线编排（FadePipeline）
-│   │
-│   ├── features/           # 12 个特征模块（f01 ~ f12）
-│   │   ├── base.py         # Feature Protocol 定义
-│   │   ├── registry.py     # 特征注册表
-│   │   └── f01.py ~ f12.py # 各特征独立实现
-│   │
-│   ├── ops/                # 底层数值算子（可复用）
-│   │   ├── mscn.py         # MSCN 计算
-│   │   ├── ce.py           # 对比度能量（LoG）
-│   │   ├── entropy.py      # 块熵（向量化 bincount）
-│   │   ├── patches.py      # 图像块分割
-│   │   └── distance.py     # 批量 Mahalanobis 距离
-│   │
-│   ├── models/
-│   │   ├── context.py      # FeatureContext（共享预计算缓存）
-│   │   └── reference_stats.py  # 参考统计数据加载（带 LRU 缓存）
-│   │
-│   └── data/               # 预计算参考统计 .mat 文件
-│       ├── natural_fogfree_image_features_ps8.mat
-│       └── natural_foggy_image_features_ps8.mat
-│
-├── tests/                  # pytest 测试套件
-├── reference/              # 原始论文（FADE.pdf）
-├── test_image/             # 示例图像
-├── test_fade.ipynb         # 交互式演示 Notebook
-└── pyproject.toml          # 项目配置（算法依赖：numpy, scipy）
-```
-
-**数据流向：**
-
-```
-RGB Image (H×W×3)
-        │
-        ▼
-   FeatureContext          ← 懒加载缓存所有中间量（R/G/B、MSCN、sigma、CV、CE 等）
-        │
-        ▼
- f01 ~ f12 各特征模块      ← 每个模块读取 context，输出 (patch_row, patch_col) 的二维图
-        │
-        ▼
-  特征矩阵 (N×12)          ← log1p 变换后拼合所有特征图
-        │
-        ├──────────────────────────────────────────┐
-        ▼                                          ▼
- 与无雾参考分布比较                          与有雾参考分布比较
- Mahalanobis 距离 Df                        Mahalanobis 距离 Dff
-        │                                          │
-        └──────────────┬───────────────────────────┘
-                       ▼
-            score = Df / (Dff + 1)
-```
-
----
-
-## 3. 模块功能说明
-
-### 3.1 公共 API 层 — `api.py` / `__init__.py`
-
-对用户暴露的唯一入口。内部持有一个单例 `FadePipeline.default()`，所有调用都委托给它。
-
-| 函数               | 说明                                                      |
-| ------------------ | --------------------------------------------------------- |
-| `fade(I)`          | 返回标量 FADE 分数                                        |
-| `fade_with_map(I)` | 返回 `(score, D_map)`，其中 `D_map` 形状为 `(H//8, W//8)` |
-
-### 3.2 流水线层 — `pipeline.py`
-
-`FadePipeline` 是整个算法的编排中心，负责将各步骤串联：
-
-1. **`build_context(image)`** — 构造 `FeatureContext` 对象，所有中间计算量在此懒加载
-2. **`compute_feature_maps(context)`** — 遍历已注册的 12 个特征模块，各自调用 `feature.compute(context)`，返回 12 张二维特征图
-3. **`build_feature_matrix(feature_maps)`** — 将特征图展平并拼合为 `(N_patches, 12)` 矩阵，再做 `log1p` 变换以压缩动态范围
-4. **`run(image)`** — 端到端执行：上述三步 + 加载参考统计 + 批量 Mahalanobis 距离 + 计算最终分数
-
-`FadePipeline.default()` 工厂方法通过 `default_feature_registry()` 加载全部 12 个特征。
-
-### 3.3 特征模块层 — `features/`
-
-#### `base.py`
-
-定义 `Feature` Protocol：每个特征模块必须提供：
-
-- `name: str` — 特征名称（如 `"f01"`）
-- `compute(context: FeatureContext) -> np.ndarray` — 返回形状为 `(patch_row_num, patch_col_num)` 的二维特征图
-
-#### `registry.py`
-
-维护有序特征列表，`canonical_feature_registry()` 按论文顺序返回 `[f01, f02, ..., f12]`。`default_feature_registry()` 为生产环境使用的别名。
-
-#### `f01.py ~ f12.py`
-
-12 个独立特征模块，每个文件导出一个 `feature` 单例对象。各模块的具体物理含义见[第 4 节](#4-fade-算法中的-12-个特征量)。
-
-### 3.4 底层算子层 — `ops/`
-
-| 文件          | 函数                                              | 功能                                                                 |
-| ------------- | ------------------------------------------------- | -------------------------------------------------------------------- |
-| `mscn.py`     | `gaussian_window()` / `compute_mscn_components()` | 构造高斯核；计算 MSCN 系数图、局部标准差图、变异系数图               |
-| `patches.py`  | `to_patches()`                                    | 将二维数组切分为 `(patch_row, patch_col, ps²)` 张量（无重叠）        |
-| `entropy.py`  | `patch_entropy()`                                 | 用 `np.bincount` 分批向量化计算 Shannon 熵，限制直方图工作内存   |
-| `ce.py`       | `compute_ce()`                                    | 对灰度/蓝黄/红绿三个通道分别应用 LoG 滤波器，计算对比度能量图        |
-| `distance.py` | `batch_mahalanobis()`                             | 分批计算 Mahalanobis 距离，使用 `np.linalg.solve` 的三维 API |
-
-`compute_ce_from_channels(gray, by, rg)` 允许直接使用已经准备好的颜色通道。流水线复用 `FeatureContext` 的 `by`、`rg` 缓存；CE 灰度仍使用未取整的 `0.299R + 0.587G + 0.114B`，与 MSCN/熵使用的灰度保持各自定义。
-
-### 3.5 数据模型层 — `models/`
-
-#### `context.py` — `FeatureContext`
-
-以 `@dataclass(slots=True)` 实现的共享计算缓存对象。12 个特征模块共享同一个 `context` 实例，所有中间量（R/G/B 分量、灰度图、暗通道图、饱和度图、MSCN 及其衍生量、对比度能量图等）在**首次访问时计算并缓存**，避免重复计算。
-
-主要属性：
-
-| 属性                        | 类型              | 含义                                 |
-| --------------------------- | ----------------- | ------------------------------------ |
-| `image`                     | `ndarray (H,W,3)` | 原始 RGB 图像（已裁剪为 8 的整数倍） |
-| `R`, `G`, `B`               | `ndarray (H,W)`   | 各颜色通道（float64）                |
-| `Ig_int`                    | `ndarray (H,W)`   | 灰度图（int32，四舍五入）            |
-| `Id`                        | `ndarray (H,W)`   | 暗通道图，`min(R,G,B)/255`           |
-| `Is`                        | `ndarray (H,W)`   | HSV 饱和度通道                       |
-| `rg`, `by`                  | `ndarray (H,W)`   | 颜色对立通道：`R-G` 和 `0.5(R+G)-B`  |
-| `mscn`                      | `ndarray (H,W)`   | MSCN 系数图                          |
-| `sigma_map`                 | `ndarray (H,W)`   | 局部标准差图                         |
-| `cv`                        | `ndarray (H,W)`   | 变异系数图                           |
-| `mscn_v`                    | `ndarray (H,W)`   | 垂直方向 MSCN 相邻乘积               |
-| `CE_gray`, `CE_by`, `CE_rg` | `ndarray (H,W)`   | 三通道对比度能量图                   |
-
-#### `reference_stats.py`
-
-使用 `@lru_cache(maxsize=1)` 缓存参考统计数据的加载，确保 `.mat` 文件在整个程序生命周期内只读取一次。
-
-### 3.6 参考数据 — `data/`
-
-| 文件                                     | 内容                                                                                         |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `natural_fogfree_image_features_ps8.mat` | 无雾自然图像的特征均值向量 `mu_fogfreeparam`（1×12）与协方差矩阵 `cov_fogfreeparam`（12×12） |
-| `natural_foggy_image_features_ps8.mat`   | 有雾自然图像的特征均值向量 `mu_foggyparam`（1×12）与协方差矩阵 `cov_foggyparam`（12×12）     |
-
-这两个文件来自原始 MATLAB 实现，包含从大规模有雾/无雾图像数据集上统计得到的特征分布参数。
-
----
-
-## 4. FADE 算法中的 12 个特征量
-
-### 预处理与通用中间量
-
-所有特征在计算前，图像被裁剪为 8 的整数倍尺寸，再切分为 **8×8 像素不重叠块**（patch size `ps = 8`），共得到 `N = (H//8) × (W//8)` 个块。每个块对应输出特征图上的一个像素点。
-
----
-
-#### 灰度图
-
-采用 ITU-R BT.601 加权公式将 RGB 转换为灰度，并四舍五入到整数：
-
-```
-Ig(x,y) = round( 0.2989·R(x,y) + 0.5870·G(x,y) + 0.1140·B(x,y) )
-```
-
-`Ig` 的值域为 `[0, 255]`，dtype 为 `int32`，用于 f09 的熵计算。
-
----
-
-#### MSCN 系数图（Mean-Subtracted Contrast Normalized）
-
-MSCN 是多个特征的共同基础，其作用是消除图像局部亮度均值和局部对比度的影响，使不同光照条件下的结构特征具有可比性。
-
-**第一步：计算局部均值（高斯加权低通滤波）**
-
-```
-μ(x,y) = Σ_{i,j} w(i,j) · Ig(x+i, y+j)
-```
-
-权重核 `w` 为 7×7 归一化二维高斯核，标准差 `σ_w = 7/6 ≈ 1.167`：
-
-```
-w(i,j) = exp(−(i² + j²) / (2·σ_w²))  / Σ_{i,j} exp(−(i² + j²) / (2·σ_w²))
-```
-
-其中 `i, j ∈ {−3, −2, −1, 0, 1, 2, 3}`。
-
-**第二步：计算局部标准差**
-
-```
-σ(x,y) = √| Σ_{i,j} w(i,j) · Ig²(x+i, y+j) − μ(x,y)² |
-```
-
-即加权二阶矩减去均值平方的绝对值开根号（取绝对值防止浮点误差导致的微小负数）。
-
-**第三步：计算 MSCN 系数**
-
-```
-MSCN(x,y) = (Ig(x,y) − μ(x,y)) / (σ(x,y) + 1)
-```
-
-分母加 `1` 是正则化项，防止低纹理区域（σ ≈ 0）出现除零。
+<a id="paper"></a>
 
-**第四步：计算变异系数**
+## 1. 论文介绍
 
-```
-CV(x,y) = σ(x,y) / μ(x,y)
-```
-
----
-
-#### 颜色对立通道
-
-仿照人类视觉系统的颜色处理机制，定义两个颜色对立通道：
-
-```
-rg(x,y) = R(x,y) − G(x,y)                 （红-绿对立轴）
-by(x,y) = 0.5·(R(x,y) + G(x,y)) − B(x,y) （蓝-黄对立轴）
-```
-
-颜色通道均为原始 uint8 值（范围 0–255），不除以 255，保留量纲。
-
----
-
-#### 暗通道图
-
-```
-Id(x,y) = min(R(x,y), G(x,y), B(x,y)) / 255
-```
-
-归一化到 `[0, 1]`。
-
----
-
-#### HSV 饱和度图
+Lark Kwon Choi, Jaehee You, and Alan Conrad Bovik. **Referenceless Prediction of Perceptual Fog Density and Perceptual Image Defogging.** IEEE Transactions on Image Processing, 24(11), 3888–3901, 2015. DOI: `10.1109/TIP.2015.2456502`. [仓库内原论文](../reference/FADE.pdf)。
 
-将 RGB 图像转换为 HSV 色彩空间（输入先归一化到 `[0,1]`），取 S 通道：
+旧文档引用中的 “Perceptual Image Quality” 不是此 PDF 的实际题名；正确后半部分是 “Perceptual Image Defogging”。本次纠正技术文档的引用，README 按约定保持现状。下文页码使用期刊印刷页码：3888–3901 对应 PDF 第 1–14 页。
 
-```
-Is(x,y) = S_HSV(x,y)  ∈ [0, 1]
-```
-
----
-
-### 特征 f01：MSCN 块方差
+<a id="paper-background"></a>
 
-**代码位置：** [`features/f01.py`](../src/fade/features/f01.py)
+### 1.1 研究问题与物理背景
 
-**完整计算步骤：**
+**论文依据：** [原论文](../reference/FADE.pdf)，§I–II-A，式 (1)–(5)，pp. 3888–3890。
 
-设块 `p` 包含 `Np = 64` 个像素位置集合 `{(x,y)}`，MSCN 均值为：
+论文希望从单张图像预测感知雾浓度，无需同一场景的无雾图像、深度或透射图、显著目标定位、辅助地理信息或主观评分监督。用于解释雾图像的简化光学模型为：
 
-```
-m_p = (1/Np) · Σ_{(x,y)∈p} MSCN(x,y)
-```
+$$
+I(x)=J(x)t(x)+A(1-t(x)),\qquad t(x)=\exp(-\beta d(x)).
+$$
 
-块方差（无偏估计，`ddof=1`）：
+其中 $J$ 为无雾场景辐射，$A$ 为全局环境光，$t$ 为透射率，$\beta$ 为衰减系数，$d$ 为场景距离。模型解释了对比度下降、颜色变淡和亮度偏移；FADE 从这些现象提取统计特征，并不在本程序中估计 $t$ 或恢复 $J$。解释：感知评分不是具有物理单位的雾浓度或能见距离。
 
-```
-f01(p) = (1/(Np−1)) · Σ_{(x,y)∈p} (MSCN(x,y) − m_p)²
-```
+<a id="paper-contributions"></a>
 
-**有雾 vs. 无雾参考均值：**
+### 1.2 FADE、参考模型与 DEFADE
 
-| 状态 | `mu_fogfreeparam[0]` | `mu_foggyparam[0]` |
-| ---- | -------------------- | ------------------ |
-| f01  | 0.3898               | 0.0999             |
+**论文依据：** [原论文](../reference/FADE.pdf)，§II-B、§III、§IV，pp. 3890–3896。
 
-**物理意义：**
+自然场景统计（NSS）描述自然图像中的统计规律。局部去均值与对比度归一化产生 MSCN 系数；论文观察到，雾会改变 MSCN 及垂直相邻乘积的分布，并使多种局部对比度、颜色和亮度特征发生变化。FADE 将 12 个特征与有雾、无雾的多元高斯（MVG）参考模型比较。无需主观评分训练不等于无需参考统计模型。
 
-MSCN 的设计目标是使无失真自然图像的系数服从均值接近 0、方差接近 1 的高斯分布。任何降质（包括雾、模糊、噪声）都会改变这一统计特性。对于有雾图像，雾气的均匀散射抑制了局部对比度，使 MSCN 系数集中于 0 附近，块内方差远小于无雾图像。**f01 在有雾时约为无雾的 1/4（0.10 vs. 0.39）**，是 12 个特征中判别能力最强的之一。
+论文的另一项贡献 DEFADE 是去雾方法：对白平衡及两种对比度增强候选图像计算权重，利用局部 FADE 信息，执行拉普拉斯多尺度融合。该方法位于 §IV，式 (21)–(33)。本项目只提供 FADE 评分和图像块密度图，未实现 DEFADE 的候选生成、权重融合或图像重建。
 
----
+<a id="paper-experiments"></a>
 
-### 特征 f02：垂直 MSCN 乘积正值方差
+### 1.3 论文的实验与结论
 
-**代码位置：** [`features/f02.py`](../src/fade/features/f02.py)
+**论文依据：** [原论文](../reference/FADE.pdf)，§III-C、§V-A、§VI-B，表 II，pp. 3893, 3896–3897。
 
-**完整计算步骤：**
+- 参考建模语料：500 张无雾图像和 500 张有雾图像，参考模型构建时选择代表性图像块。
+- 主观实验：另取与参考语料内容分离的 100 张测试图像，由 20 名参与者评定雾程度并形成 MOS。
+- 论文报告：8×8 图像块取得最佳 LCC 0.8934（计算前做逻辑非线性回归）；16×16 图像块取得最佳 SROCC 0.8756。两个最佳值来自不同图像块尺寸。
+- 论文还以去雾结果检验 FADE，并比较 DEFADE 的视觉效果与客观指标。这些属于论文实验，本项目未重新执行该主观研究。
 
-**第一步：** 计算垂直方向的 MSCN 相邻像素乘积图（逐元素乘法，向上移位一行）：
+<a id="flow"></a>
 
-```
-MSCN_V(x,y) = MSCN(x,y) · MSCN(x−1, y)
-```
+## 2. 符号与整体流程
 
-（在代码中用 `np.roll(MSCN, 1, axis=0)` 实现向下滚动，等效为上一行与当前行的乘积）
+本节起，未特别标记为“论文”的公式表示当前程序的计算。图像块尺寸固定为 $P=8$；块编号 $b$ 按行优先排列。
 
-**第二步：** 在块 `p` 内，筛选正值子集，计算无偏方差：
+$$
+n_r=\lfloor H/P\rfloor,\quad n_c=\lfloor W/P\rfloor,\quad H_c=Pn_r,\quad W_c=Pn_c,\quad N=n_rn_c,\quad K=P^2=64.
+$$
 
-```
-S⁺(p) = { MSCN_V(x,y) : MSCN_V(x,y) > 0, (x,y) ∈ p }
+| 符号 | 含义与尺寸 |
+| --- | --- |
+| $I$ | RGB 输入，$(H,W,3)$，约定为 `uint8`、0–255 |
+| $I_c$ | 裁剪后的 RGB 图像，$(H_c,W_c,3)$，保留左上区域 |
+| $p_b$ | 第 $b$ 个 8×8 图像块，包含 $K=64$ 个像素 |
+| $Y,\mu,\sigma,M,V$ | 灰度、局部均值、局部标准差、MSCN、垂直乘积图，$(H_c,W_c)$ |
+| $F_k$ | 第 $k$ 个特征图，$(n_r,n_c)$，$k=1,\ldots,12$ |
+| $z_b$、$Z$ | 经 `log1p` 的特征向量、矩阵，$(12,)$、$(N,12)$ |
+| $\nu_r,\Sigma_r$ | 类别 $r$ 的参考均值、协方差，$(12,)$、$(12,12)$ |
+| $v_b$、$C_b^{(r)}$ | 当前程序的块内特征方差标量、混合矩阵，标量、$(12,12)$ |
+| $d_b^{(r)},D$、$D_{\mathrm{map}}$ | 块距离、全图评分、密度图，$(N,)$、标量、$(n_r,n_c)$ |
 
-f02(p) = Var{ S⁺(p) }  =  (1/(|S⁺|−1)) · Σ_{v∈S⁺} (v − mean(S⁺))²
+```mermaid
+flowchart TD
+    I["RGB 输入: H x W x 3"] --> C["裁剪: Hc x Wc x 3"]
+    C --> P["FeatureContext: 通道、MSCN、CE"]
+    P --> F["f01...f12: nr x nc"]
+    F --> Z["log1p: N x 12"]
+    Z --> V["每块 12 个特征分量的方差"]
+    Z --> DF["到无雾参考模型的距离"]
+    Z --> DG["到有雾参考模型的距离"]
+    V --> DF
+    V --> DG
+    R["缓存的 .mat 参考统计量"] --> DF
+    R --> DG
+    DF --> S["距离均值之比: 整体评分"]
+    DG --> S
+    DF --> M["逐块距离之比: 密度图"]
+    DG --> M
 ```
-
-**有雾 vs. 无雾参考均值：**
 
-| 状态 | `mu_fogfreeparam[1]` | `mu_foggyparam[1]` |
-| ---- | -------------------- | ------------------ |
-| f02  | 0.1196               | 0.0106             |
+公共 API 为 `fade(I) -> float` 和 `fade_with_map(I) -> (float, ndarray)`。两者都执行完整流水线；`fade()` 仅在返回时丢弃密度图。评分越高通常表示感知雾更浓。图像内容、噪声和其他失真也可能影响统计量，不能把评分单独解释为通用图像质量或去雾保真度。
 
-**物理意义：**
+<a id="features"></a>
 
-`MSCN_V(x,y) > 0` 意味着像素 `(x,y)` 与其正上方邻居 `(x−1,y)` 的 MSCN 系数**同号**，即两者相对于局部均值的偏移方向一致（同为偏亮或同为偏暗）。在自然清晰图像中，场景结构造成相邻像素具有相关性，同号对的分布范围较宽，方差高。雾气使相邻像素的 MSCN 系数都趋向零，同号对趋近 `0·0 = 0`，方差骤降。**f02 在有雾时约为无雾的 1/11**。
+## 3. 预处理与 12 个特征
 
----
+<a id="preprocessing"></a>
 
-### 特征 f03：垂直 MSCN 乘积负值方差
-
-**代码位置：** [`features/f03.py`](../src/fade/features/f03.py)
-
-**完整计算步骤：**
-
-与 f02 完全互补，筛选负值（及零值）子集：
-
-```
-S⁻(p) = { MSCN_V(x,y) : MSCN_V(x,y) ≤ 0, (x,y) ∈ p }
+### 3.1 共享预处理
 
-f03(p) = Var{ S⁻(p) }
-```
+**程序事实：** [`models/context.py`](../src/fade/models/context.py) 先裁剪图像，再按需缓存通道。R/G/B 转为 `float64`；灰度有两个不同定义：
 
-**有雾 vs. 无雾参考均值：**
+$$
+Y=\operatorname{round}(0.2989R+0.5870G+0.1140B),\qquad Y_{\mathrm{CE}}=0.299R+0.587G+0.114B.
+$$
 
-| 状态 | `mu_fogfreeparam[2]` | `mu_foggyparam[2]` |
-| ---- | -------------------- | ------------------ |
-| f03  | 0.0738               | 0.0083             |
+$Y$ 保存为 `int32`，用于 MSCN 和熵；$Y_{\mathrm{CE}}$ 不取整，用于灰度 CE。`np.round` 的半整数舍入规则为 ties-to-even。颜色对立通道为：
 
-**物理意义：**
+$$
+rg=R-G,\qquad yb=0.5(R+G)-B.
+$$
 
-`MSCN_V(x,y) ≤ 0` 对应垂直方向上**异号**的相邻像素对，即存在从亮到暗（或暗到亮）的过渡，代表亮度边缘或纹理边界。f02 与 f03 合称"垂直成对乘积统计"，共同刻画了 MSCN 的垂直空间相关结构：
+论文称第二个通道为 yellow-blue（`yb`）；代码使用变量名 `by`，但符号与上式一致。它们是浮点差值，可为负数，不能称为 0–255 的 `uint8` 通道。
 
-- f02（同号方差）→ 描述均匀区域内部的变化幅度
-- f03（异号方差）→ 描述边缘两侧的跨越幅度
+**论文依据：** [原论文](../reference/FADE.pdf)，§II-B，式 (6)–(8)，p. 3891。
 
-雾气对二者的抑制机制相同，均使乘积值向 0 收缩。**f03 在有雾时约为无雾的 1/9**。
+$$
+w_{ij}=\frac{\exp[-(i^2+j^2)/(2s_w^2)]}{\sum_{u=-3}^{3}\sum_{v=-3}^{3}\exp[-(u^2+v^2)/(2s_w^2)]},\quad i,j\in\{-3,\ldots,3\},\quad s_w=7/6.
+$$
 
----
+$$
+\mu=w*Y,\qquad \sigma=\sqrt{\left|w*(Y^2)-\mu^2\right|},\qquad M=\frac{Y-\mu}{\sigma+1},\qquad \xi=\frac{\sigma}{\mu}.
+$$
 
-### 特征 f04：局部标准差均值
+程序由 [`ops/mscn.py`](../src/fade/ops/mscn.py) 使用 7×7 高斯核、`mode="nearest"` 卷积。绝对值处理浮点误差可能造成的负二阶矩差；MSCN 的分母加 1，而 $\xi$ 的分母没有保护项。论文说明 7×7 支撑与归一化高斯权重；这里的 $s_w=7/6$、边界模式和灰度舍入属于可核对的代码参数。
 
-**代码位置：** [`features/f04.py`](../src/fade/features/f04.py)
+定义块平均 $\langle A\rangle_b=K^{-1}\sum_{x\in p_b}A(x)$。以下 $V_1(a)$ 表示样本方差：对 $n$ 个参与计算的值，减去均值后平方求和，再除以 $n-1$。`nanvar` 会忽略 `NaN`，`var`/`std` 不会；这些函数都不会自动删除 `inf`。
 
-**完整计算步骤：**
+$$
+V_1(a)=\frac{1}{n-1}\sum_{i=1}^{n}(a_i-\bar a)^2,\qquad \bar a=\frac{1}{n}\sum_{i=1}^{n}a_i.
+$$
 
-`σ(x,y)` 即 MSCN 预处理中已计算的局部标准差图（见"预处理"节）。
+<a id="feature-index"></a>
 
-```
-f04(p) = (1/Np) · Σ_{(x,y)∈p} σ(x,y)
-```
+### 3.2 特征顺序与论文对应
 
-**有雾 vs. 无雾参考均值：**
+| 特征 | 内容 | 论文依据 | 代码 |
+| --- | --- | --- | --- |
+| [f01](#f01) | MSCN 方差 | Table I; Eq. (6) | [`features/f01.py`](../src/fade/features/f01.py) |
+| [f02](#f02) | 非负垂直乘积方差 | Table I; Eq. (9) | [`features/f02.py`](../src/fade/features/f02.py) |
+| [f03](#f03) | 非正垂直乘积方差 | Table I; Eq. (9) | [`features/f03.py`](../src/fade/features/f03.py) |
+| [f04](#f04) | 局部标准差均值 | Eq. (8) | [`features/f04.py`](../src/fade/features/f04.py) |
+| [f05](#f05) | 变异系数均值 | Eq. (10) | [`features/f05.py`](../src/fade/features/f05.py) |
+| [f06](#f06) | 灰度 CE 均值 | Eqs. (11)–(12) | [`features/f06.py`](../src/fade/features/f06.py) |
+| [f07](#f07) | 黄蓝 CE 均值 | Eqs. (11)–(12) | [`features/f07.py`](../src/fade/features/f07.py) |
+| [f08](#f08) | 红绿 CE 均值 | Eqs. (11)–(12) | [`features/f08.py`](../src/fade/features/f08.py) |
+| [f09](#f09) | 灰度熵 | Eq. (13) | [`features/f09.py`](../src/fade/features/f09.py) |
+| [f10](#f10) | 像素暗通道均值 | Eq. (14) | [`features/f10.py`](../src/fade/features/f10.py) |
+| [f11](#f11) | 饱和度均值 | Eq. (15) | [`features/f11.py`](../src/fade/features/f11.py) |
+| [f12](#f12) | 色彩丰富度 | Eq. (16) | [`features/f12.py`](../src/fade/features/f12.py) |
 
-| 状态 | `mu_fogfreeparam[3]` | `mu_foggyparam[3]` |
-| ---- | -------------------- | ------------------ |
-| f04  | 3.2159               | 0.6081             |
+表 I 与特征定义位于 pp. 3891–3892；§III-B 说明 f04–f08、f10、f11 在块内取平均，其余特征直接由块计算。以下解释的雾相关趋势是统计直觉，不保证对任意图像都严格单调。
 
-注意：参考均值是对 `log1p(f04)` 变换后的值，因此实际特征值更大。
+<a id="f01"></a>
 
-**物理意义：**
+### 3.3 f01：MSCN 方差
 
-`σ(x,y)` 是以灰度值为单位的**绝对局部对比度**，描述了每个像素 7×7 邻域内亮度变化的幅度。f04 取块内 64 个像素位置上 σ 的算术均值，是对该块"纹理丰富程度"最直接的量化。在无雾自然图像中，场景含有丰富的纹理（树叶、道路、建筑细节），σ 值普遍较大；雾气的均匀散射填平了亮度差异，σ 大幅下降，**f04 在有雾时仅为无雾的约 1/5**。
+$$
+f_1(b)=V_1\bigl(\{M(x):x\in p_b\}\bigr).
+$$
 
----
+**定义与含义：** 衡量归一化局部结构的离散程度；雾引起的局部对比度变化会影响 MSCN 分布的宽度（§III-A、表 I，p. 3891–3892）。
 
-### 特征 f05：变异系数均值
+**实现步骤：** 取得共享 $M$ → 切成 $(n_r,n_c,64)$ → 对最后一维执行 `np.nanvar(..., ddof=1)`。统计的是 MSCN 系数，不是原图灰度方差。
 
-**代码位置：** [`features/f05.py`](../src/fade/features/f05.py)
+<a id="f02"></a>
 
-**完整计算步骤：**
+### 3.4 f02：非负垂直乘积方差
 
-变异系数（Coefficient of Variation，CV）是局部标准差与局部均值之比：
+$$
+V(i,j)=M(i,j)M((i-1)\bmod H_c,j),\qquad S_b^+=\{V(x):x\in p_b,\ V(x)\geq0\},\qquad f_2(b)=V_1(S_b^+).
+$$
 
-```
-CV(x,y) = σ(x,y) / μ(x,y)
+**定义与含义：** 表示垂直邻域中同号 MSCN 乘积的分散程度，对应论文表 I 的正侧方差（式 (9)，p. 3891）。
 
-f05(p) = (1/Np) · Σ_{(x,y)∈p} CV(x,y)
-```
+**实现步骤：** `M * np.roll(M, 1, axis=0)` 生成共享乘积图 → 分块 → 复制块数组，将负值设为 `NaN` → `nanvar(ddof=1)`。0 被保留。论文式 (9) 写的是 $(i+1,j)$；代码使用上一行，并将首行与末行相乘。块归属和边界不同，不能直接宣称相同。
 
-**有雾 vs. 无雾参考均值：**
+<a id="f03"></a>
 
-| 状态 | `mu_fogfreeparam[4]` | `mu_foggyparam[4]` |
-| ---- | -------------------- | ------------------ |
-| f05  | 0.2928               | 0.0048             |
+### 3.5 f03：非正垂直乘积方差
 
-**物理意义：**
+$$
+S_b^-=\{V(x):x\in p_b,\ V(x)\leq0\},\qquad f_3(b)=V_1(S_b^-).
+$$
 
-CV 是对 f04 绝对对比度的补充，提供**相对对比度**度量。与 f04 相比，CV 除以了局部均值 μ，对整体亮度变化（如不同天气、不同时刻的光照）更加鲁棒。雾气的两重作用使 CV 对雾极为敏感：
+**定义与含义：** 表示异号乘积的分散程度，与 f02 一起描述垂直乘积分布两侧的形状（§III-A、表 I）。
 
-1. 雾使局部标准差 σ 减小（分子减小）
-2. 雾使整体亮度提升（大气光叠加），均值 μ 增大（分母增大）
+**实现步骤：** 复用 f02 的乘积块 → 复制，将正值设为 `NaN` → `nanvar(ddof=1)`。0 同时参与 f02 与 f03；若保留下来的非 `NaN` 值不足 2 个，结果为 `NaN`，可触发自由度警告。
 
-两者相乘导致 CV 剧烈下降，**f05 在有雾时约为无雾的 1/60**，是 12 个特征中雾判别比例最大的特征之一。
+<a id="f04"></a>
 
----
+### 3.6 f04：局部标准差均值
 
-### 特征 f06：灰度对比度能量均值
+$$
+f_4(b)=\langle\sigma\rangle_b.
+$$
 
-**代码位置：** [`features/f06.py`](../src/fade/features/f06.py)、[`ops/ce.py`](../src/fade/ops/ce.py)
+**定义与含义：** 用局部灰度波动描述锐度和结构信息（论文式 (8)，p. 3891）。
 
-**完整计算步骤：**
+**实现步骤：** 从 MSCN 的共享计算中取得 $\sigma$ → 分块 → `np.mean(..., axis=2)`。这是每像素高斯加权标准差的块平均，不是直接对整块灰度求一次标准差。单位与未归一化的灰度强度一致。
 
-**第一步：构造一维 LoG（Laplacian of Gaussian）滤波核**
+<a id="f05"></a>
 
-先构造标准差 `σ_L = 3.25` 的归一化一维高斯核（在范围 `[−3·σ_L, 3·σ_L)` 即约 `[−9.75, 9.75)` 内采样）：
+### 3.7 f05：变异系数均值
 
-```
-G(x) = (1 / (√(2π)·σ_L)) · exp(−x² / (2·σ_L²))
-G  /= Σ G(x)    （归一化使和为 1）
-```
+$$
+f_5(b)=\langle\xi\rangle_b=\left\langle\frac{\sigma}{\mu}\right\rangle_b.
+$$
 
-再对其求二阶导数，得到 LoG 核（未归一化）：
+**定义与含义：** 相对局部亮度衡量灰度离散程度（论文式 (10)，p. 3892）。
 
-```
-LoG(x) = (x²/σ_L⁴ − 1/σ_L²) · G(x)
-```
+**实现步骤：** 逐像素计算 $\sigma/\mu$ → 分块 → 求平均。不是 $\langle\sigma\rangle_b/\langle\mu\rangle_b$；代码不加 epsilon，也不使用 `nanmean`，因此零均值区域可能传递 `NaN` 或 `inf`。
 
-然后进行两步归一化（与 MATLAB 实现对齐）：
+<a id="ce"></a>
 
-```
-LoG -= mean(LoG)                            （去均值，使核的直流响应为零）
-LoG /= Σ (0.5 · x² · LoG(x))               （能量归一化）
-```
+### 3.8 f06–f08 共用的对比度能量算子
 
-**第二步：分离卷积（可分离 LoG）**
+**论文依据：** [原论文](../reference/FADE.pdf)，§III-A，式 (11)–(12)，p. 3892。
 
-```
-cx(x,y) = Σ_k LoG(k) · gray(x, y+k)       （水平方向一维卷积）
-cy(x,y) = Σ_k LoG(k) · gray(x+k, y)       （垂直方向一维卷积）
-```
+**程序事实：** [`ops/ce.py`](../src/fade/ops/ce.py) 对 $c\in\{Y_{\mathrm{CE}},yb,rg\}$ 计算两个方向的高斯二阶导数响应，再做幅值组合、除法归一化和噪声阈值处理。这里是两个方向的响应能量，不应将它简写成一次二维拉普拉斯滤波。
 
-卷积前对图像边界进行 20 像素的复制填充（`border = 20`）以减少边缘效应。
+$$
+Z_c=\sqrt{(c*h_h)^2+(c*h_v)^2},\qquad \alpha_c=\max_{x}Z_c(x),\qquad R_c=\frac{\alpha_c Z_c}{Z_c+0.1\alpha_c}.
+$$
 
-**第三步：合并水平和垂直响应**
+$$
+\mathrm{CE}_c(x)=\begin{cases}R_c(x)-\tau_c,&R_c(x)-\tau_c>10^{-7},\\0,&\text{otherwise}.\end{cases}
+$$
 
-```
-CE_raw(x,y) = √(cx(x,y)² + cy(x,y)²)
-```
+$\alpha_c$ 在整张裁剪图像的当前通道上计算，不是每个 8×8 块独立计算。论文给出尺度约 3.25 像素、窗口大小 20、增益 0.1，三个阈值约为 0.2353、0.2287、0.0528。当前源码保留了更具体的数值：
 
-这相当于计算各向同性 LoG 的梯度幅值，即二维边缘响应的 L2 范数。
+| 通道 | 阈值 $\tau_c$ 的源码表达式 |
+| --- | --- |
+| gray | `9.225496406318721e-4 * 255` |
+| yb (`by`) | `8.969246659629488e-4 * 255` |
+| rg | `2.069284034165411e-4 * 255` |
 
-**第四步：Weber 对比度归一化**
+核的离散构造也影响复现。令 $s=3.25$，`break_off_sigma=3.0`；`np.arange(-3s,3s,1)` 生成 $q=0,\ldots,19$ 的 20 个采样点。先生成归一化高斯，再去除导数核的直流分量，并做二阶矩归一化：
 
-```
-CE_max = max{ CE_raw(x,y) }  （全图最大值）
-CE_norm(x,y) = (CE_raw(x,y) · CE_max) / (CE_raw(x,y) + 0.1 · CE_max)
-```
+$$
+\begin{aligned}
+&u_q=-3s+q,\\
+&g_q=\frac{\exp(-u_q^2/(2s^2))}{\sum_{j=0}^{19}\exp(-u_j^2/(2s^2))},\\
+&a_q=\left(\frac{u_q^2}{s^4}-\frac{1}{s^2}\right)g_q,\\
+&b_q=a_q-\frac{1}{20}\sum_{j=0}^{19}a_j,\\
+&h_q=\frac{b_q}{\sum_{j=0}^{19}u_j^2 b_j/2}.
+\end{aligned}
+$$
 
-此式是 Weber-Fechner 定律的近似实现（"感知对比度 ∝ log(物理对比度)"），将线性响应压缩为感知尺度。
+实现用 1×20 核及其转置，`ndimage.convolve(..., mode="constant")` 保持 SciPy 默认 `origin=0`。`border=20` 的默认路径先按原顺序拼接顶部/底部各 10 行、左右各 10 列，再在卷积后去掉这圈数据。这是边缘条带拼接，不能解释为重复单个边缘像素，也不同于 MSCN 的 `nearest` 模式。若 $\alpha_c=0$，除法可产生 `NaN`，但阈值比较为假，输出对应位置保持 0；现有纯色 CE 测试接受该结果。
 
-**第五步：阈值截断（半波整流）**
+<a id="f06"></a>
 
-```
-τ₁ = 9.2255×10⁻⁴ × 255 ≈ 0.2353   （灰度通道阈值）
-CE_gray(x,y) = max(CE_norm(x,y) − τ₁, 0)
-```
+### 3.9 f06：灰度 CE 均值
 
-**第六步：计算块均值**
+$$
+f_6(b)=\langle\mathrm{CE}_{Y_{\mathrm{CE}}}\rangle_b.
+$$
 
-```
-f06(p) = (1/Np) · Σ_{(x,y)∈p} CE_gray(x,y)
-```
+**计算步骤与含义：** 取得未取整的灰度通道 → 使用上述 CE 算子与灰度阈值 → 分块求平均。解释：捕捉亮度结构的局部对比度；所有 CE 参数均见上一节。 论文依据为式 (11)–(12) 与 §III-B，p. 3892。
 
-**有雾 vs. 无雾参考均值：**
+<a id="f07"></a>
 
-| 状态 | `mu_fogfreeparam[5]` | `mu_foggyparam[5]` |
-| ---- | -------------------- | ------------------ |
-| f06  | 1.8623               | 0.1880             |
+### 3.10 f07：黄蓝 CE 均值
 
-**物理意义：**
+$$
+f_7(b)=\langle\mathrm{CE}_{yb}\rangle_b.
+$$
 
-LoG 滤波器对应人类视觉皮层的 V1 区"中央-环绕"感受野（center-surround receptive field），能够检测二阶导数意义下的亮度边缘（zero-crossing）。`CE_gray` 衡量图像在灰度维度的**感知边缘能量**。雾气通过散射使场景的高频细节（边缘、纹理）模糊，LoG 响应在有雾时大幅降低。**f06 在有雾时约为无雾的 1/10**。
+**计算步骤与含义：** 取得 $yb=0.5(R+G)-B$（代码 `by`）→ 使用黄蓝阈值计算 CE → 分块求平均。解释：描述黄蓝色对立通道中的对比度变化，而不是该通道强度的平均。 论文依据为式 (11)–(12) 与 §III-B，p. 3892。
 
----
+<a id="f08"></a>
 
-### 特征 f07：蓝-黄通道对比度能量均值
+### 3.11 f08：红绿 CE 均值
 
-**代码位置：** [`features/f07.py`](../src/fade/features/f07.py)
+$$
+f_8(b)=\langle\mathrm{CE}_{rg}\rangle_b.
+$$
 
-**完整计算步骤：**
+**计算步骤与含义：** 取得 $rg=R-G$ → 使用红绿阈值计算 CE → 分块求平均。解释：与 f07 一起描述色度结构的变化；雾往往减弱这些结构，但具体结果依赖图像内容。 论文依据为式 (11)–(12) 与 §III-B，p. 3892。
 
-首先构造蓝-黄颜色对立通道（颜色值未归一化，范围约 `[−255, 255]`）：
+<a id="f09"></a>
 
-```
-by(x,y) = 0.5·R(x,y) + 0.5·G(x,y) − B(x,y)
-```
+### 3.12 f09：灰度熵
 
-然后按与 f06 完全相同的流程（LoG 滤波 → L2 合并 → Weber 归一化 → 阈值截断），但使用蓝-黄专属阈值：
+$$
+p_b(h)=\frac{\#\{x\in p_b:Y(x)=h\}}{64},\qquad f_9(b)=-\sum_{h=0}^{255}p_b(h)\log_2 p_b(h),\qquad 0\log_2 0=0.
+$$
 
-```
-τ₂ = 8.9692×10⁻⁴ × 255 ≈ 0.2287
-CE_by(x,y) = max(CE_norm_by(x,y) − τ₂, 0)
+**定义与含义：** 衡量块内灰度分布的信息量。论文式 (13)（p. 3892）写 `log`，当前代码明确采用底数 2，单位为 bit。8×8 块最多有 64 个样本，因此最大熵为 6 bit，即使灰度有 256 个可能取值。
 
-f07(p) = (1/Np) · Σ_{(x,y)∈p} CE_by(x,y)
-```
+**实现步骤：** 使用取整后的 $Y$ → 切成 64 像素块 → [`ops/entropy.py`](../src/fade/ops/entropy.py) 每批最多 4096 块，通过块索引 ×256 的偏移和 `bincount` 同时统计独立直方图 → 概率归一化并求和。不是对 RGB 三个通道分别取熵。
 
-**有雾 vs. 无雾参考均值：**
+<a id="f10"></a>
 
-| 状态 | `mu_fogfreeparam[6]` | `mu_foggyparam[6]` |
-| ---- | -------------------- | ------------------ |
-| f07  | 1.1503               | 0.1313             |
+### 3.13 f10：像素暗通道均值
 
-**物理意义：**
+$$
+I_{\mathrm{dark}}(x)=\frac{\min(R(x),G(x),B(x))}{255},\qquad f_{10}(b)=\langle I_{\mathrm{dark}}\rangle_b.
+$$
 
-`by` 通道模拟人眼 S 型锥细胞与 L+M 型锥细胞之间的**蓝-黄颜色对立**感知机制。在户外场景中，天空（蓝色）与地面植被（黄绿色）之间的 `by` 通道存在显著空间变化；雾气使场景颜色整体偏向灰白，`by` 通道的空间梯度减弱。相比灰度 CE（f06），颜色 CE 提供了额外的、独立于亮度的雾检测信号，二者在 Mahalanobis 距离中互补。
+**定义与含义：** 衡量每个像素最暗颜色通道的亮度（论文式 (14)，p. 3892）。雾的环境光可提高暗通道值；天空或白色物体也可能有较高数值。
 
----
+**实现步骤：** 对每像素三个通道取最小值 → 除以 255 → 分块平均，范围为 [0,1]。没有再执行空间邻域最小值滤波，因此不能与包含空间最小值的完整暗通道先验算子混同。
 
-### 特征 f08：红-绿通道对比度能量均值
+<a id="f11"></a>
 
-**代码位置：** [`features/f08.py`](../src/fade/features/f08.py)
+### 3.14 f11：饱和度均值
 
-**完整计算步骤：**
+$$
+\begin{aligned}
+&U=I_c/255,\\
+&u_{\max}=\max_c U_c,\\
+&u_{\min}=\min_c U_c,\\
+&S=\begin{cases}(u_{\max}-u_{\min})/u_{\max},&u_{\max}>0,\\0,&u_{\max}=0,\end{cases}\\
+&f_{11}(b)=\langle S\rangle_b.
+\end{aligned}
+$$
 
-首先构造红-绿颜色对立通道：
+**定义与含义：** 对应 HSV 的 S 通道，刻画颜色相对于亮度的纯度（论文式 (15)，p. 3892）。灰色和黑色的饱和度为 0。
 
-```
-rg(x,y) = R(x,y) − G(x,y)
-```
+**实现步骤：** RGB 转为 `float32` 后除以 255 → 求通道最大值和最小值 → `np.divide(..., where=maximum>0)`，黑色位置保持 0 → 分块平均。代码只计算 S，没有计算 H/V；float32 的归一化和运算顺序属于实现约定。
 
-然后同样的 LoG + Weber + 阈值流程，使用红-绿专属阈值（比前两者小得多，因为 rg 通道的动态范围较窄）：
+<a id="f12"></a>
 
-```
-τ₃ = 2.0693×10⁻⁴ × 255 ≈ 0.0528
-CE_rg(x,y) = max(CE_norm_rg(x,y) − τ₃, 0)
+### 3.15 f12：色彩丰富度
 
-f08(p) = (1/Np) · Σ_{(x,y)∈p} CE_rg(x,y)
-```
+$$
+\begin{aligned}
+&m_{a,b}=\langle a\rangle_b,\\
+&s_{a,b}=\sqrt{V_1(\{a(x):x\in p_b\})},\\
+&a\in\{rg,yb\},\\
+&f_{12}(b)=\sqrt{s_{rg,b}^2+s_{yb,b}^2}+0.3\sqrt{m_{rg,b}^2+m_{yb,b}^2}.
+\end{aligned}
+$$
 
-**有雾 vs. 无雾参考均值：**
+**定义与含义：** 第一项描述颜色的空间变化，第二项描述偏离灰色轴的均值偏移；权重为 0.3（论文式 (16)，p. 3892）。
 
-| 状态 | `mu_fogfreeparam[7]` | `mu_foggyparam[7]` |
-| ---- | -------------------- | ------------------ |
-| f08  | 1.0316               | 0.2368             |
+**实现步骤：** 将共享 $rg,yb$ 分块 → 两通道各执行 `np.std(..., ddof=1)` 与 `np.mean` → 按公式组合。使用未归一化的颜色差值。论文式 (16) 后定义的方差分母为 $X$，代码标准差对应的方差分母为 $K-1$。这是可确认的样本/总体方差差异；文档不将其默认为等价。
 
-**物理意义：**
+<a id="score"></a>
 
-`rg` 通道模拟人眼 L 型与 M 型锥细胞之间的**红-绿颜色对立**感知机制。对于含有植被（绿色）、人工设施（红色/橙色标识）的道路场景，rg 通道有丰富的空间结构；雾气的均质化使颜色边缘消失，f08 下降。τ₃ 远小于 τ₁、τ₂，反映红-绿通道的信噪比相对较低，需要更低的截断阈值才能保留有效的边缘响应。
+## 4. 参考统计与评分
 
-f06、f07、f08 三者构成对**亮度**、**蓝-黄色度**和**红-绿色度**三个维度的对比度能量完整刻画。
+<a id="reference-models"></a>
 
----
+### 4.1 论文参考模型与项目数据
 
-### 特征 f09：图像块熵
+**论文依据：** [原论文](../reference/FADE.pdf)，§III-B–D，式 (17)–(19)，pp. 3892–3893。
 
-**代码位置：** [`features/f09.py`](../src/fade/features/f09.py)、[`ops/entropy.py`](../src/fade/ops/entropy.py)
+论文构建参考模型时，对参考语料的特征做 min–max 归一化，并用 f1、f4、f6、f9、f10、f11 选择代表性图像块；f10 在选择时反向处理。无雾语料倾向选择高信息块，有雾语料使用相反不等式。测试图像使用全部图像块。归一化和选择属于参考模型构建步骤，不能误加到当前推理路径上。
 
-**完整计算步骤：**
+$$
+p(z;\nu,\Sigma)=\frac{\exp[-\tfrac12(z-\nu)^\mathsf{T}\Sigma^{-1}(z-\nu)]}{(2\pi)^{12/2}|\Sigma|^{1/2}}.
+$$
 
-**第一步：** 对块 `p`（64 个整数灰度值，范围 `[0, 255]`），统计灰度值直方图：
+上式为论文式 (18) 的 12 维 MVG 密度。论文说明均值和协方差采用最大似然估计。项目只加载下列预计算参数，没有参考语料、图像块筛选或重新拟合训练入口：
 
-```
-n_p(v) = |{ (x,y) ∈ p : Ig(x,y) = v }|,   v = 0, 1, ..., 255
-```
+| 文件 | 均值键 / 存储形状 | 协方差键 / 存储形状 |
+| --- | --- | --- |
+| [`natural_fogfree_image_features_ps8.mat`](../src/fade/data/natural_fogfree_image_features_ps8.mat) | `mu_fogfreeparam` / `(1,12)` | `cov_fogfreeparam` / `(12,12)` |
+| [`natural_foggy_image_features_ps8.mat`](../src/fade/data/natural_foggy_image_features_ps8.mat) | `mu_foggyparam` / `(1,12)` | `cov_foggyparam` / `(12,12)` |
 
-**第二步：** 将计数转化为经验概率：
+**程序事实：** 两组参数均为 `float64`。[`models/reference_stats.py`](../src/fade/models/reference_stats.py) 用 `importlib.resources` 定位包内数据，`scipy.io.loadmat` 读取，并用 `lru_cache(maxsize=1)` 缓存。文件命名和维度与 8×8、12 特征推理相符；仅凭这些文件，无法验证其生成语料、筛选过程或与作者官方参数逐字节一致。
 
-```
-p_p(v) = n_p(v) / Np,   其中 Np = 64
-```
+<a id="feature-matrix"></a>
 
-**第三步：** 计算 Shannon 信息熵（以 2 为底，单位 bit），并约定 `0·log₂(0) = 0`：
+### 4.2 特征矩阵与程序的方差标量
 
-```
-f09(p) = H(p) = − Σ_{v=0}^{255} p_p(v) · log₂(p_p(v))
-```
+$$
+z_{b,k}=\ln(1+f_k(b)),\quad Z\in\mathbb{R}^{N\times12},\qquad v_b=\operatorname{nanvar}(z_{b,1},\ldots,z_{b,12};\mathrm{ddof}=1).
+$$
 
-**最大可能值：** 当块内 64 个像素均匀分布在所有 64 个不同灰度值时，H = log₂(64) = 6 bit。若恰好均匀分布在全部 256 个灰度值（理论极限），H = log₂(256) = 8 bit。
+特征图按 f01–f12 排序并沿行优先展平，再按列拼合。`np.log1p` 使用自然对数；论文 §III-D 说明使用对数非线性，但正文未将它明确写成 `log1p`。$v_b$ 是一个块的不同特征分量之间的方差，**不是**跨图像块估计的 12×12 特征协方差，也不是块内 64 个像素的方差。
 
-**有雾 vs. 无雾参考均值：**
+<a id="distance"></a>
 
-| 状态 | `mu_fogfreeparam[8]` | `mu_foggyparam[8]` |
-| ---- | -------------------- | ------------------ |
-| f09  | 1.8414               | 0.9126             |
+### 4.3 混合矩阵与距离
 
-**物理意义：**
+**论文依据：** [原论文](../reference/FADE.pdf)，§III-D，式 (19)，pp. 3893–3894。
 
-Shannon 熵量化了块内灰度分布的**不确定性**，即信息丰富程度。直觉上：
+论文的 Mahalanobis-like 距离使用参考模型与测试图像 MVG 拟合的均值和协方差：
 
-- **低熵块**：像素灰度几乎相同（如均匀蓝天、白墙），分布集中
-- **高熵块**：像素灰度多样（如繁茂树叶、道路纹理），分布分散
+$$
+d_{\mathrm{paper}}=\sqrt{(\nu_1-\nu_2)^\mathsf{T}\left(\frac{\Sigma_1+\Sigma_2}{2}\right)^{-1}(\nu_1-\nu_2)}.
+$$
 
-雾气的散射使所有像素的亮度向雾亮度值（约 200–240）收缩，块内灰度分布从宽泛变为集中在高亮度区域的窄带，熵值明显下降。**f09 在有雾时约为无雾的 1/2**，且由于熵对分布形状敏感，它能捕捉到其他统计量无法反映的非线性分布变化。
+**当前程序公式：** 令 $J_{12}=\mathbf{1}_{12}\mathbf{1}_{12}^{\mathsf T}$ 为全 1 矩阵；类别 $r$ 为 `free` 或 `foggy`。
 
-**向量化实现（`ops/entropy.py`）：**
+$$
+\begin{aligned}
+&\Delta_b^{(r)}=\nu_r-z_b,\\
+&C_b^{(r)}=\frac{v_bJ_{12}+\Sigma_r}{2},\\
+&C_b^{(r)}x_b^{(r)}=\Delta_b^{(r)},\\
+&d_b^{(r)}=\sqrt{\max\left((\Delta_b^{(r)})^\mathsf{T}x_b^{(r)},0\right)}.
+\end{aligned}
+$$
 
 ```python
-# 为每个块的像素值加上偏移量，使 N 个块的直方图落入不同的 bin 区间
-offsets = arange(N) * 256                   # shape (N,)
-flat_idx = flat + offsets[:, newaxis]        # shape (N, 64)
-counts = bincount(flat_idx.ravel(), minlength=N*256).reshape(N, 256)
+batch_cov = (patch_var[start:stop, np.newaxis, np.newaxis] + ref_cov) / 2.0
+x = np.linalg.solve(batch_cov, mu[:, :, np.newaxis])
+dist_sq = np.einsum("ni,ni->n", mu, x[:, :, 0])
+distances[start:stop] = np.sqrt(np.maximum(dist_sq, 0.0))
 ```
 
-通过此技巧，每批最多 4096 个块的直方图统计被压缩为一次 `bincount` 调用，避免逐块 Python 循环。概率除法与熵乘法在工作数组上原地执行；批次之间互不影响，计算结果与整批统计一致。
+此片段来自 [`ops/distance.py`](../src/fade/ops/distance.py) 的循环体，`mu` 是当前批次的 $\Delta$，`ref_cov` 是 $\Sigma_r$。方差形状为 `(B,1,1)`，广播会加到参考矩阵的**所有元素**，不是只加对角线：旧文档的单位矩阵 $I_{12}$ 解释错误。程序使用每批最多 4096 块的直接线性求解，未显式构造逆矩阵；负的二次型被截为 0，`NaN` 保留，也没有奇异矩阵的正则化或求解失败回退。
 
----
+<a id="aggregation"></a>
 
-### 特征 f10：暗通道均值
+### 4.4 整体评分与局部密度图
 
-**代码位置：** [`features/f10.py`](../src/fade/features/f10.py)
+**论文依据：** [原论文](../reference/FADE.pdf)，式 (20)，§VI-A，pp. 3894, 3897。
 
-**完整计算步骤：**
+$$
+\begin{aligned}
+&D_f=\operatorname{nanmean}_b d_b^{(\mathrm{free})},\\
+&D_{ff}=\operatorname{nanmean}_b d_b^{(\mathrm{foggy})},\\
+&D=\frac{D_f}{D_{ff}+1},\\
+&D_{\mathrm{map}}(b)=\frac{d_b^{(\mathrm{free})}}{d_b^{(\mathrm{foggy})}+1}.
+\end{aligned}
+$$
 
-逐像素取三个颜色通道的最小值（Dark Channel），然后归一化至 `[0,1]`：
+论文的 $D_f$ 名为 foggy level，实际是到**无雾**参考模型的距离；$D_{ff}$ 名为 fog-free level，实际是到**有雾**参考模型的距离。代码保持这一对应。常数 1 稳定分母。整体评分是两个距离均值的比，通常不等于密度图的均值；两组 `nanmean` 各自忽略自己的 `NaN`，没有先构建共同有效块掩码。若全部无效，整体评分可为 `NaN`。输出密度图保持块顺序，没有插值到像素分辨率、引导滤波或归一化到 [0,1]。
 
-```
-Id(x,y) = min(R(x,y), G(x,y), B(x,y)) / 255
-```
+<a id="implementation"></a>
 
-再对块内取均值：
+## 5. 程序实现
 
-```
-f10(p) = (1/Np) · Σ_{(x,y)∈p} Id(x,y)
-```
+<a id="module-map"></a>
 
-**有雾 vs. 无雾参考均值（注意：此特征在有雾时反向增大）：**
+### 5.1 模块职责与调用关系
 
-| 状态 | `mu_fogfreeparam[9]` | `mu_foggyparam[9]` |
-| ---- | -------------------- | ------------------ |
-| f10  | 0.1715               | 0.5680             |
+| 层 | 代码入口 | 职责 |
+| --- | --- | --- |
+| API | [`api.py`](../src/fade/api.py) | 单例默认流水线；返回标量或标量与图 |
+| Pipeline | [`pipeline.py`](../src/fade/pipeline.py) | 创建上下文、特征矩阵、距离与输出 |
+| Feature | [`features/base.py`](../src/fade/features/base.py) / [`features/registry.py`](../src/fade/features/registry.py) | 静态类型 Protocol 与固定 f01–f12 顺序 |
+| Context | [`models/context.py`](../src/fade/models/context.py) | 当前图像的按需缓存与分块工具 |
+| Ops | [`ops/mscn.py`](../src/fade/ops/mscn.py) / [`ops/ce.py`](../src/fade/ops/ce.py) / [`ops/entropy.py`](../src/fade/ops/entropy.py) / [`ops/distance.py`](../src/fade/ops/distance.py) / [`ops/patches.py`](../src/fade/ops/patches.py) | 可复用的数值算子 |
+| Reference | [`models/reference_stats.py`](../src/fade/models/reference_stats.py) | 预计算参数的包内读取与进程内缓存 |
 
-**物理意义：**
-
-基于 He et al. (2009) 的**暗通道先验（Dark Channel Prior, DCP）**。该先验建立在对大规模无雾户外图像的统计观察上：对于无雾自然图像，在每个局部区域中，几乎总存在至少一个颜色通道的像素值非常低（接近 0），即"暗像素"普遍存在——深色物体（黑色沥青路面）、阴影区域（树叶背面）、彩色表面（纯绿色植物的 R 通道和 B 通道极低）等都会产生暗通道。
-
-大气散射（雾）的物理模型为：
-
-```
-I_hazy(x,y) = t(x,y)·I_fog-free(x,y) + (1 − t(x,y))·A
-```
-
-其中 `t(x,y) ∈ (0,1]` 为透射率，`A` 为大气光（接近白色，约 240/255）。大气光 `A` 对三个通道均为正值，强制提升了 `min(R,G,B)` 的下界，使暗通道值增大。**f10 在有雾时约为无雾的 3.3 倍**，是唯一一个在有雾时显著增大（而非减小）的特征。
-
----
-
-### 特征 f11：色饱和度均值
-
-**代码位置：** [`features/f11.py`](../src/fade/features/f11.py)
-
-**完整计算步骤：**
-
-首先将 RGB 图像（归一化至 `[0,1]`）转换到 HSV 色彩空间：
-
-```
-Vmax = max(R/255, G/255, B/255)
-Vmin = min(R/255, G/255, B/255)
-Δ    = Vmax − Vmin
-
-S_HSV(x,y) = Δ / Vmax        （若 Vmax > 0，否则 S = 0）
+```mermaid
+flowchart TD
+    API["api.fade / api.fade_with_map"] --> RUN["FadePipeline.run"]
+    RUN --> CTX["build_context: FeatureContext"]
+    CTX --> FEATURES["compute_feature_maps: registry f01...f12"]
+    FEATURES --> OPS["上下文懒加载属性 + ops"]
+    FEATURES --> MATRIX["build_feature_matrix"]
+    MATRIX --> DIST["batch_mahalanobis: 无雾 / 有雾"]
+    STATS["load_reference_stats"] --> DIST
+    DIST --> OUTPUT["run: 评分、密度图"]
 ```
 
-然后取块均值：
+`Feature` 是 `typing.Protocol`，约定 `name` 和 `compute(context)`，不是带运行时抽象检查的 `abc.ABC`。每个特征模块导出一个无状态 `feature` 对象。`FadePipeline.default()` 从注册表生成完整序列；`run()` 检查特征矩阵非空且列数为 12，但不会逐个验证名字和语义顺序。自行替换注册顺序或特征会改变与参考模型的对应关系。公开 API 没有图像块尺寸参数；内部 `FeatureContext.patch_size` 可设置，不代表现有参考参数支持其他尺寸。
 
-```
-f11(p) = (1/Np) · Σ_{(x,y)∈p} S_HSV(x,y)
-```
+<a id="cache"></a>
 
-**有雾 vs. 无雾参考均值：**
+### 5.2 共享缓存与数据类型
 
-| 状态 | `mu_fogfreeparam[10]` | `mu_foggyparam[10]` |
-| ---- | --------------------- | ------------------- |
-| f11  | 0.4430                | 0.0418              |
+每次 `run()` 建立一个新的 `FeatureContext`，同一次推理的 12 个特征共享它。首次访问 `mscn` 时同时生成 $M,\sigma,\xi$；首次访问 `CE_gray` 时同时生成三通道 CE。f02/f03 共享 `mscn_v_patches`，CE 与 f12 共享 `rg/by`。这些缓存属于单次图像处理，不是跨图像的结果缓存；参考 `.mat` 则使用全局 LRU 缓存。
 
-**物理意义：**
+| 数组 | 数据类型 | 形状 |
+| --- | --- | --- |
+| 裁剪后的 RGB | 输入类型，通常为 `uint8` | `(Hc,Wc,3)` |
+| R/G/B, MSCN, sigma, CV, rg/by, CE | `float64` | `(Hc,Wc)` |
+| 取整灰度 / 熵索引 | `int32` | `(Hc,Wc)` / 取决于批次 |
+| 饱和度 | `float32` | `(Hc,Wc)` |
+| 特征图 | 通常为 `float64`；f11 为 `float32` | `(nr,nc)` |
+| 特征矩阵 | `float64` | `(N,12)` |
+| 参考参数 / 输出密度图 | `float64` | `(12,)`, `(12,12)` / `(nr,nc)` |
 
-HSV 饱和度 `S = (Vmax−Vmin)/Vmax` 衡量颜色的**纯度**或**鲜艳程度**：
+<a id="array-flow"></a>
 
-- `S = 0`：灰色（R = G = B），无色彩
-- `S = 1`：纯色，不含白色成分
+### 5.3 分块、矩阵构造与源码片段
 
-雾气将大气光（接近白色、R ≈ G ≈ B）叠加到场景上，使三个通道的值趋于相等，导致 `Vmax − Vmin` 减小，S 下降。即使是鲜艳的颜色，经过足够浓厚的雾气后也会退化为接近灰白色的样貌。**f11 在有雾时约为无雾的 1/10**，与 f12 共同从颜色角度量化雾的漂白效应。
+[`ops/patches.py`](../src/fade/ops/patches.py) 使用 `reshape(nr,8,nc,8)` → `transpose(0,2,1,3)` → `reshape(nr,nc,64)`；内部最后两个空间维度被展平，特征图 `ravel()` 对应相同的行优先块序。转置后再展平可能产生副本，因此不能称为始终零拷贝。
 
----
+以下是 `build_feature_matrix()` 的非空输入分支；它先创建新的矩阵，再原地变换，不修改原特征图：
 
-### 特征 f12：色彩丰富度
-
-**代码位置：** [`features/f12.py`](../src/fade/features/f12.py)
-
-**完整计算步骤：**
-
-对块 `p` 内的 64 个像素，分别计算两个颜色对立通道 `rg` 和 `by` 的统计量（样本标准差，`ddof=1`）：
-
-```
-σ_rg(p) = std{ rg(x,y) : (x,y) ∈ p }  =  √( (1/(Np−1)) · Σ (rg − mean_rg)² )
-σ_by(p) = std{ by(x,y) : (x,y) ∈ p }
-
-μ_rg(p) = mean{ rg(x,y) : (x,y) ∈ p }
-μ_by(p) = mean{ by(x,y) : (x,y) ∈ p }
+```python
+flattened = [feature_map.ravel() for feature_map in feature_maps]
+feat = np.column_stack(flattened).astype(np.float64, copy=False)
+return np.log1p(feat, out=feat)
 ```
 
-色彩丰富度公式（Hasler & Süsstrunk, 2003）：
+自然对数矩阵随后按每块求方差，用两类参考参数分别计算距离，最终构造整体评分和密度图。参数转换用 `astype(..., copy=False)`；引用已有 `float64` 参数时避免额外副本，不改变参考数值。
 
-```
-f12(p) = √(σ_rg(p)² + σ_by(p)²)  +  0.3 · √(μ_rg(p)² + μ_by(p)²)
-```
+<a id="comparison"></a>
 
-公式由两项组成：
+## 6. 论文与实现对照
 
-- **第一项** `√(σ_rg² + σ_by²)`：颜色**空间变化性**，即块内颜色多样程度（色彩纹理）
-- **第二项** `0.3·√(μ_rg² + μ_by²)`：颜色**均值偏移量**，即块整体颜色倾向离灰色轴（rg=0, by=0）的距离
+本表区分明确差异、正文未规定的实现约定和未经核对的内容。差异记录并不自动判定代码应怎样修改；本次不改变算法。
 
-**有雾 vs. 无雾参考均值：**
+| 项目 | 论文依据 | 当前实现与核对结论 |
+| --- | --- | --- |
+| 12 特征与参考类别 | 表 I、式 (19)–(20) | 特征类别、标准顺序及两类距离比相对应；仍需分别审查数值约定。 |
+| 图像块 | §III-B、§VI-A：尺寸与重叠可变 | API 固定 8×8、非重叠，裁剪底部与右侧；随附 ps8 参数。 |
+| MSCN 与灰度 | 式 (6)–(8)、式 (11) 后的灰度公式 | 代码明确 7/6 高斯尺度、nearest 边界、两种灰度和取整；这些细节不能全由论文正文推出。 |
+| 相邻乘积 | 式 (9)：使用下一行 | 代码使用上一行及环绕边界；正、负侧都包含 0。 |
+| CE 与边界 | 式 (11)–(12)：3.25、20、0.1 与约数阈值 | 代码给出精确核采样、直流去除、边缘条带拼接和 >1e-7 掩码；无官方实现核对。 |
+| 熵 | 式 (13)：log，未明确底数 | 代码使用 log2、取整灰度与 256 个直方图格。 |
+| 色彩丰富度 | 式 (16) 定义总体方差，分母 X | 代码 std(ddof=1)，分母 K-1；明确数值差异。 |
+| 对数变换 | §III-D：对数非线性 | 代码使用自然对数 log1p；论文未明确 +1 约定。 |
+| 测试图像协方差 | 式 (18)–(19)：MVG 均值与完整协方差拟合 | 代码每块使用 z_b 和跨 12 分量的方差，广播为 v_b J12；不是全图 MVG 拟合，论文未推导此替代。 |
+| 整体评分 | 式 (20)：Df/(Dff+1) | 代码先独立 nanmean 两组块距离再求比；不是局部评分的均值。 |
+| 参考参数与实验 | 500+500 参考语料、100 图像主观实验 | 只提供 .mat、三个样例与软件测试；参数来源过程和 MOS 相关性均未独立复现。 |
+| 去雾与图像质量 | §IV 与 §VI-C：DEFADE 与多指标评价 | 本项目没有 DEFADE 或通用图像质量预测入口。 |
 
-| 状态 | `mu_fogfreeparam[11]` | `mu_foggyparam[11]` |
-| ---- | --------------------- | ------------------- |
-| f12  | 3.3037                | 1.3155              |
+<a id="validation"></a>
 
-**物理意义：**
+## 7. 样例、测试与限制
 
-色彩丰富度综合了两种颜色信息来源：颜色纹理（空间分布）和整体色偏（均值分布）。其设计来自对人类主观色彩鲜艳度判断的心理物理学实验——受试者认为"色彩丰富"的图像，其 `rg` 和 `by` 通道的标准差与均值都偏大。雾气的散射光接近中性灰白（在颜色坐标中，`rg ≈ 0`，`by ≈ 0`），叠加到场景后：
+<a id="samples"></a>
 
-1. 使所有颜色向灰白收缩，颜色均值 `|μ_rg|`、`|μ_by|` 减小（第二项减小）
-2. 使块内颜色变得均匀（"一片灰白"），颜色标准差 `σ_rg`、`σ_by` 减小（第一项减小）
+### 7.1 三张随附图像
 
-**f12 在有雾时约为无雾的 2/5**，能够从彩色角度补充 f11（饱和度）未捕捉到的空间颜色变化信息。
+以下为当前程序的实测结果，输入均通过 Pillow 转为 RGB。环境为 Python 3.13.3、NumPy 2.4.3、SciPy 1.17.1。评分保留 10 位小数；文件为本项目样例，不是原论文 100 图像实验的完整复现。
 
----
+| 图像 | 输入 `(H,W,3)` | 裁剪后 `(Hc,Wc,3)` | FADE 评分 | 密度图 `(nr,nc)` |
+| --- | --- | --- | --- | --- |
+| [test_image1.png](../test_image/test_image1.png) | `(768,576,3)` | `(768,576,3)` | `0.9113393845` | `(96,72)` |
+| [test_image2.JPG](../test_image/test_image2.JPG) | `(800,600,3)` | `(800,600,3)` | `2.7121977531` | `(100,75)` |
+| [test_image3.jpg](../test_image/test_image3.jpg) | `(531,800,3)` | `(528,800,3)` | `5.7674386227` | `(66,100)` |
 
-### 12 个特征的综合对比
+在项目根目录、包含 `demo` 依赖的环境中运行下列完整示例。它只读取样例图像，不修改文件；清晰和中等雾样例可能出现下文记录的自由度警告。
 
-下表汇总了无雾/有雾图像参考集的特征均值（均为 `log1p` 变换后的值），以及有雾与无雾的比值：
+<a id="sample-code"></a>
 
-| #   | 特征名称               | 无雾参考均值 | 有雾参考均值 | 有雾/无雾 比 | 雾浓时趋势 |
-| --- | ---------------------- | ------------ | ------------ | ------------ | ---------- |
-| f01 | MSCN 块方差            | 0.3898       | 0.0999       | 0.26         | ↓ 减小     |
-| f02 | 垂直 MSCN 乘积正值方差 | 0.1196       | 0.0106       | 0.09         | ↓ 减小     |
-| f03 | 垂直 MSCN 乘积负值方差 | 0.0738       | 0.0083       | 0.11         | ↓ 减小     |
-| f04 | 局部标准差均值         | 3.2159       | 0.6081       | 0.19         | ↓ 减小     |
-| f05 | 变异系数均值           | 0.2928       | 0.0048       | 0.02         | ↓ 减小     |
-| f06 | 灰度对比度能量均值     | 1.8623       | 0.1880       | 0.10         | ↓ 减小     |
-| f07 | 蓝-黄 CE 均值          | 1.1503       | 0.1313       | 0.11         | ↓ 减小     |
-| f08 | 红-绿 CE 均值          | 1.0316       | 0.2368       | 0.23         | ↓ 减小     |
-| f09 | 图像块熵               | 1.8414       | 0.9126       | 0.50         | ↓ 减小     |
-| f10 | 暗通道均值             | 0.1715       | 0.5680       | **3.31**     | **↑ 增大** |
-| f11 | 色饱和度均值           | 0.4430       | 0.0418       | 0.09         | ↓ 减小     |
-| f12 | 色彩丰富度             | 3.3037       | 1.3155       | 0.40         | ↓ 减小     |
+```python
+from pathlib import Path
+import numpy as np
+from PIL import Image
+from fade import fade_with_map
 
-注意：f10（暗通道）是唯一一个在有雾时**增大**的特征，其余 11 个特征在有雾时均减小。这种混合的变化方向提高了 Mahalanobis 距离对有雾/无雾分布的判别能力。
-
----
-
-## 5. 评分计算：Mahalanobis 距离与 FADE 分数
-
-**特征矩阵变换：**
-
-将 12 个特征图展平拼合，对每个块得到 12 维特征向量，再取 `log1p` 变换压缩动态范围：
-
-```
-feat[n, :] = log1p([f01_n, f02_n, ..., f12_n])   n = 0..N_patches-1
+for name in ("test_image1.png", "test_image2.JPG", "test_image3.jpg"):
+    with Image.open(Path("test_image") / name) as image:
+        rgb = np.array(image.convert("RGB"))
+    score, density_map = fade_with_map(rgb)
+    print(f"{name}: shape={rgb.shape}, score={score:.10f}, map={density_map.shape}")
 ```
 
-**每块协方差估计：**
-
-以块内特征向量的方差作为对角协方差代理：
-
-```
-patch_var[n] = Var{ feat[n, k] : k = 0..11 }   （无偏估计，ddof=1）
+```text
+test_image1.png: shape=(768, 576, 3), score=0.9113393845, map=(96, 72)
+test_image2.JPG: shape=(800, 600, 3), score=2.7121977531, map=(100, 75)
+test_image3.jpg: shape=(531, 800, 3), score=5.7674386227, map=(66, 100)
 ```
 
-**Mahalanobis 距离：**
+<a id="tests"></a>
 
-对每个块，计算到无雾分布（`mu_free`, `cov_free`）的距离 `Df` 和到有雾分布（`mu_foggy`, `cov_foggy`）的距离 `Dff`：
+### 7.2 现有测试的范围与验证结果
 
-```
-C_i = (patch_var[i] · I₁₂ₓ₁₂ + ref_cov) / 2   （逐块协方差，混合了块内变异与参考协方差）
-d_i = √( (ref_mu − feat[i])ᵀ · C_i⁻¹ · (ref_mu − feat[i]) )
-```
+在项目根目录运行：
 
-其中 `C_i⁻¹ · v` 用 `np.linalg.solve(C_i, v)` 求解以提升数值稳定性。
-
-**FADE 分数：**
-
-```
-D = mean(Df) / (mean(Dff) + 1)
+```bash
+uv sync --extra demo --extra test
+uv run --extra test pytest
+uv run --extra test pytest -m "not slow"
 ```
 
-直觉理解：若图像无雾，其特征向量远离有雾分布（Dff 大）而接近无雾分布（Df 小），比值小；若图像有浓雾，Df 大而 Dff 小，比值大。分母加 1 防止除零。
+pip 环境可使用 `pip install -e ".[demo,test]"`，再执行 `python -m pytest`。本次已在现有虚拟环境执行完整 `python -m pytest -q`：**261 项通过，13 条 RuntimeWarning**，pytest 9.0.2。未新增测试或重新执行论文主观实验。
 
-逐块密度图：
+| 范围 | 现有测试依据与含义 |
+| --- | --- |
+| API / Pipeline | [test_api_integration.py](../tests/test_api_integration.py) / [test_pipeline.py](../tests/test_pipeline.py) — 返回类型、尺寸、重复性、非 8 倍数裁剪、16×16 小图、32×32 纯灰图。真实图像评分测试允许 10% 相对误差，参考值来自 Notebook，而非独立 MATLAB 基准。 |
+| Features / Cache | [test_features_f01_f12.py](../tests/test_features_f01_f12.py) / [test_features_registry.py](../tests/test_features_registry.py) / [test_models_context.py](../tests/test_models_context.py) — 12 特征形状、数值性质、顺序、通道公式、缓存与典型颜色饱和度。 |
+| Ops | [test_ops_entropy.py](../tests/test_ops_entropy.py) / [test_ops_distance.py](../tests/test_ops_distance.py) / [test_ops_ce.py](../tests/test_ops_ce.py) / [test_ops_mscn.py](../tests/test_ops_mscn.py) / [test_ops_patches.py](../tests/test_ops_patches.py) — 已知熵值、分批边界、与独立熵及直接求解的比较、float32 距离类型、滤波/拼接和分块行为。 |
+| Reference | [test_models_reference.py](../tests/test_models_reference.py) — 参数键、维度、有限性、对称性、半正定性与缓存；不验证生成数据来源。 |
 
-```
-D_map[i,j] = Df_map[i,j] / (Dff_map[i,j] + 1)
-```
+软件测试通过说明当前行为满足这些断言。它不能证明参考参数的原始生成过程、与官方实现完全一致，或在论文主观数据上达到相同 LCC/SROCC。
 
----
+<a id="limits"></a>
 
-## 6. 性能优化要点
+### 7.3 当前边界行为与适用限制
 
-当前实现相对于原始 Python 移植版本做了以下关键向量化优化：
+- **输入约定与实际校验：** 文档约定 RGB、`uint8`、`(H,W,3)`。API 没有统一的类型、形状与最小尺寸检查；部分错误来自底层 NumPy/SciPy。饱和度属性另有数值范围检查，但这不是完整输入验证。不要把浮点输入、任意通道数或任意小图视为已承诺支持。
+- **小图：** 现有端到端测试覆盖 16×16。小于一个块的尺寸裁剪后会产生空维度；CE 的边缘条带实现也依赖图像大小。测试不能支持“只要有一个 8×8 块就一定正常”的结论。
+- **无效值：** f02/f03 的有效样本不足、CV 的零均值除法或其他退化数据可产生 `NaN/inf`。`np.errstate` 不会消除 `nanvar` 的自由度警告。f03 和 CE 除法构成本次报告的 13 条警告；NaN 在管线中并未全部替换为 0。
+- **聚合与求解：** `nanmean` 只忽略 NaN，不自动忽略 inf。全部无效时的均值警告在最终聚合处被抑制，但仍可返回 NaN。距离求解没有奇异矩阵回退。
+- **输出解释：** 密度图是块网格，评分没有固定等级阈值，也不限定为 [0,1]。用单一 FADE 数值判断去雾质量时，仍需考察保真度、伪影与其他评价指标。
+- **复现边界：** 本仓库没有论文参考语料、MOS 标签、完整训练/筛选流程或官方代码核对记录；本次验证只覆盖随附样例和现有测试。
 
-| 优化项               | 原始方式                                 | 优化后                                          | 效果                 |
-| -------------------- | ---------------------------------------- | ----------------------------------------------- | -------------------- |
-| **图像块熵（f09）**  | O(N) Python 循环逐块统计直方图           | `np.bincount` 偏移技巧，每批最多统计 4096 块 | ~100× 加速（1080p）  |
-| **Mahalanobis 距离** | 两个 O(N) `linalg.solve` 循环            | 三维数组 API，每批最多 4096 个 `np.linalg.solve`        | 约 50× 加速          |
-| **协方差矩阵构造**   | `np.tile/repeat` 构造 (N·12×12) 巨型矩阵 | 广播操作在 (N,12,12) 张量上原地构造             | 大幅降低内存分配     |
-| **图像块切分**       | `sliding_window_view` + 步长索引         | `reshape + transpose` 向量化切分                | 减少内存复制         |
-| **参考数据加载**     | 每次调用重新读取 `.mat` 文件             | `@lru_cache(maxsize=1)` 仅加载一次              | 消除重复 I/O         |
-| **中间量复用**       | 各特征独立重复计算                       | `FeatureContext` 懒加载+字典缓存                | 消除跨特征的重复计算 |
+<a id="references"></a>
 
+## 8. 优化与参考资料
 
-### 当前实现的进一步优化
+<a id="optimizations"></a>
 
-- **饱和度**：仅计算 `(max(R,G,B) - min(R,G,B)) / max(R,G,B)`，保留原来的 float32 归一化与舍入；黑色像素的饱和度设为 0，省去完整 HSV 转换。
-- **颜色通道复用**：CE 与色彩丰富度共用蓝黄、红绿通道，省去重复 RGB 转换与通道计算。
-- **有界工作内存**：熵直方图和距离求解均按最多 4096 个图像块处理，避免按全图块数同时分配大型临时数组。
-- **特征矩阵**：`log1p` 在新建的特征矩阵上原地执行，保留输入特征图；参考统计转换使用 `copy=False`，省去无用副本。
-- **依赖精简**：核心算法仅依赖 NumPy、SciPy。Matplotlib、IPykernel、Pillow 在 `demo` 可选依赖中，使用 Notebook 前运行 `uv sync --extra demo`。
+### 8.1 当前优化机制
 
-本机以单张 RGB uint8 图像测试，每项预热后运行 5 次、取中位数。1920×1080 随机图像（`np.random.default_rng(123)` 生成）耗时由约 1.072 秒降至 0.849 秒（减少约 21%），`tracemalloc` 测得峰值内存由约 461 MiB 降至 329 MiB（减少约 29%）。内存值是调用期间的新增分配峰值，不是进程 RSS。该数值为本机测量结果，不包含图像读取；不同硬件与图像内容会影响性能。三张示例图像、随机小图、纯色图与 1080p 随机图的 12 个特征图、评分、密度图均逐元素精确一致。
+- **共享中间量：** R/G/B、MSCN 与相关图、rg/by、CE 在上下文中按需缓存，避免跨特征重复生成。
+- **只计算所需饱和度：** 保留 float32 路径，省去完整 HSV 的 H/V 计算及相关数组。
+- **分批熵直方图：** 每批最多 4096 块；概率除法与熵乘法原地执行，直方图工作数组不随整图块数无限增长。
+- **分批距离求解：** 每批最多 4096 个 12×12 矩阵，降低同时存活的协方差数组数量。并没有使用线程池或多进程；分批向量化不等于显式并行调度。
+- **减少副本：** 新建特征矩阵上的 `log1p(out=...)`、参数 `copy=False` 和参考数据缓存减少分配及 I/O。
+- **内存范围：** 分批只限制相关工作数组；图像通道、特征图、展平块数组等仍随图像尺寸增长。因此总内存不是固定常数。
+
+本次没有新增性能实验。旧文档的 100×、50× 等倍率以及缺少完整测量记录的比较不作为验证结论保留。以上描述解释代码机制，不承诺特定硬件上的速度或内存数值。
+
+<a id="source-index"></a>
+
+### 8.2 引用与证据索引
+
+| 论文位置 | 内容 | PDF 页码 |
+| --- | --- | --- |
+| §I–II-A; Eqs. (1)–(5), pp. 3888–3890 | 研究问题与光学模型 | 1–3 |
+| §II-B; Eqs. (6)–(8), p. 3891 | MSCN | 4 |
+| §III-A–B; Table I; Eqs. (9)–(16), pp. 3891–3892 | 特征与图像块聚合 | 4–5 |
+| §III-B–D; Eqs. (17)–(19), pp. 3892–3893 | 参考块选择、MVG、距离 | 5–6 |
+| Eq. (20); §IV; Eqs. (21)–(33), pp. 3894–3896 | FADE 比值与 DEFADE | 7–9 |
+| §V-A; §VI-A–B; Table II, pp. 3896–3897 | 主观实验与 FADE 结果 | 9–10 |
+| §VI-C; Tables IV–V, pp. 3898–3899 | DEFADE 评价 | 11–12 |
+
+以上论文内容均来自[本地 PDF](../reference/FADE.pdf)，未查找外部官方实现。源码链接指向本仓库当前文件；[Notebook](../test_fade.ipynb) 展示样例与密度图。若以后修改算法或参考参数，应同时核对三种语言的公式、对照表和样例记录。
