@@ -20,7 +20,6 @@
    - [底层算子层](#34-底层算子层--ops)
    - [数据模型层](#35-数据模型层--models)
    - [参考数据](#36-参考数据--data)
-   - [遗留实现](#37-遗留实现--fadepy--cepy)
 4. [FADE 算法中的 12 个特征量](#4-fade-算法中的-12-个特征量)
    - [预处理与通用中间量](#预处理与通用中间量)
    - [特征 f01：MSCN 块方差](#特征-f01mscn-块方差)
@@ -80,18 +79,15 @@ fade_py/
 │   │   ├── context.py      # FeatureContext（共享预计算缓存）
 │   │   └── reference_stats.py  # 参考统计数据加载（带 LRU 缓存）
 │   │
-│   ├── data/               # 预计算参考统计 .mat 文件
-│   │   ├── natural_fogfree_image_features_ps8.mat
-│   │   └── natural_foggy_image_features_ps8.mat
-│   │
-│   ├── fade.py             # 遗留整体实现（基准对照）
-│   └── ce.py               # 遗留对比度能量实现
+│   └── data/               # 预计算参考统计 .mat 文件
+│       ├── natural_fogfree_image_features_ps8.mat
+│       └── natural_foggy_image_features_ps8.mat
 │
-├── tests/                  # pytest 测试套件（256 个测试）
-├── reference/              # 原始论文与参考实现压缩包
+├── tests/                  # pytest 测试套件
+├── reference/              # 原始论文（FADE.pdf）
 ├── test_image/             # 示例图像
 ├── test_fade.ipynb         # 交互式演示 Notebook
-└── pyproject.toml          # 项目配置（依赖：numpy, scipy, matplotlib）
+└── pyproject.toml          # 项目配置（算法依赖：numpy, scipy）
 ```
 
 **数据流向：**
@@ -165,9 +161,11 @@ RGB Image (H×W×3)
 | ------------- | ------------------------------------------------- | -------------------------------------------------------------------- |
 | `mscn.py`     | `gaussian_window()` / `compute_mscn_components()` | 构造高斯核；计算 MSCN 系数图、局部标准差图、变异系数图               |
 | `patches.py`  | `to_patches()`                                    | 将二维数组切分为 `(patch_row, patch_col, ps²)` 张量（无重叠）        |
-| `entropy.py`  | `patch_entropy()`                                 | 用 `np.bincount` 向量化计算所有块的 Shannon 熵，避免 Python 层循环   |
+| `entropy.py`  | `patch_entropy()`                                 | 用 `np.bincount` 分批向量化计算 Shannon 熵，限制直方图工作内存   |
 | `ce.py`       | `compute_ce()`                                    | 对灰度/蓝黄/红绿三个通道分别应用 LoG 滤波器，计算对比度能量图        |
-| `distance.py` | `batch_mahalanobis()`                             | 批量计算所有块的 Mahalanobis 距离，使用 `np.linalg.solve` 的三维 API |
+| `distance.py` | `batch_mahalanobis()`                             | 分批计算 Mahalanobis 距离，使用 `np.linalg.solve` 的三维 API |
+
+`compute_ce_from_channels(gray, by, rg)` 允许直接使用已经准备好的颜色通道。流水线复用 `FeatureContext` 的 `by`、`rg` 缓存；CE 灰度仍使用未取整的 `0.299R + 0.587G + 0.114B`，与 MSCN/熵使用的灰度保持各自定义。
 
 ### 3.5 数据模型层 — `models/`
 
@@ -203,10 +201,6 @@ RGB Image (H×W×3)
 | `natural_foggy_image_features_ps8.mat`   | 有雾自然图像的特征均值向量 `mu_foggyparam`（1×12）与协方差矩阵 `cov_foggyparam`（12×12）     |
 
 这两个文件来自原始 MATLAB 实现，包含从大规模有雾/无雾图像数据集上统计得到的特征分布参数。
-
-### 3.7 遗留实现 — `fade.py` / `ce.py`
-
-`src/fade/fade.py` 是原始的单文件实现，将所有计算内联在一个函数中（不使用 `FeatureContext` 和模块化特征），用作性能基准对照。`ce.py` 是对应的遗留对比度能量计算模块。这两个文件在生产中不被调用（`api.py` 指向 `pipeline.py`），但被排除在测试覆盖统计之外（见 `pyproject.toml`）。
 
 ---
 
@@ -654,7 +648,7 @@ flat_idx = flat + offsets[:, newaxis]        # shape (N, 64)
 counts = bincount(flat_idx.ravel(), minlength=N*256).reshape(N, 256)
 ```
 
-通过此技巧，N 个块的直方图统计被压缩为一次 `bincount` 全局调用，避免了 Python 层的 N 次循环。
+通过此技巧，每批最多 4096 个块的直方图统计被压缩为一次 `bincount` 调用，避免逐块 Python 循环。概率除法与熵乘法在工作数组上原地执行；批次之间互不影响，计算结果与整批统计一致。
 
 ---
 
@@ -853,9 +847,20 @@ D_map[i,j] = Df_map[i,j] / (Dff_map[i,j] + 1)
 
 | 优化项               | 原始方式                                 | 优化后                                          | 效果                 |
 | -------------------- | ---------------------------------------- | ----------------------------------------------- | -------------------- |
-| **图像块熵（f09）**  | O(N) Python 循环逐块统计直方图           | `np.bincount` 偏移技巧，一次向量化统计全部 N 块 | ~100× 加速（1080p）  |
-| **Mahalanobis 距离** | 两个 O(N) `linalg.solve` 循环            | 三维数组 API，单次批量 `np.linalg.solve`        | 约 50× 加速          |
+| **图像块熵（f09）**  | O(N) Python 循环逐块统计直方图           | `np.bincount` 偏移技巧，每批最多统计 4096 块 | ~100× 加速（1080p）  |
+| **Mahalanobis 距离** | 两个 O(N) `linalg.solve` 循环            | 三维数组 API，每批最多 4096 个 `np.linalg.solve`        | 约 50× 加速          |
 | **协方差矩阵构造**   | `np.tile/repeat` 构造 (N·12×12) 巨型矩阵 | 广播操作在 (N,12,12) 张量上原地构造             | 大幅降低内存分配     |
-| **图像块切分**       | `sliding_window_view` + 步长索引         | `reshape + transpose` 零拷贝切分                | 减少内存复制         |
+| **图像块切分**       | `sliding_window_view` + 步长索引         | `reshape + transpose` 向量化切分                | 减少内存复制         |
 | **参考数据加载**     | 每次调用重新读取 `.mat` 文件             | `@lru_cache(maxsize=1)` 仅加载一次              | 消除重复 I/O         |
 | **中间量复用**       | 各特征独立重复计算                       | `FeatureContext` 懒加载+字典缓存                | 消除跨特征的重复计算 |
+
+
+### 当前实现的进一步优化
+
+- **饱和度**：仅计算 `(max(R,G,B) - min(R,G,B)) / max(R,G,B)`，保留原来的 float32 归一化与舍入；黑色像素的饱和度设为 0，省去完整 HSV 转换。
+- **颜色通道复用**：CE 与色彩丰富度共用蓝黄、红绿通道，省去重复 RGB 转换与通道计算。
+- **有界工作内存**：熵直方图和距离求解均按最多 4096 个图像块处理，避免按全图块数同时分配大型临时数组。
+- **特征矩阵**：`log1p` 在新建的特征矩阵上原地执行，保留输入特征图；参考统计转换使用 `copy=False`，省去无用副本。
+- **依赖精简**：核心算法仅依赖 NumPy、SciPy。Matplotlib、IPykernel、Pillow 在 `demo` 可选依赖中，使用 Notebook 前运行 `uv sync --extra demo`。
+
+本机以单张 RGB uint8 图像测试，每项预热后运行 5 次、取中位数。1920×1080 随机图像（`np.random.default_rng(123)` 生成）耗时由约 1.072 秒降至 0.849 秒（减少约 21%），`tracemalloc` 测得峰值内存由约 461 MiB 降至 329 MiB（减少约 29%）。内存值是调用期间的新增分配峰值，不是进程 RSS。该数值为本机测量结果，不包含图像读取；不同硬件与图像内容会影响性能。三张示例图像、随机小图、纯色图与 1080p 随机图的 12 个特征图、评分、密度图均逐元素精确一致。

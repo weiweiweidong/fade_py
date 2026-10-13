@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from matplotlib.colors import rgb_to_hsv
-
-from ..ops.ce import compute_ce
+from ..ops.ce import compute_ce_from_channels
 from ..ops.mscn import compute_mscn_components
 from ..ops.patches import to_patches
 
@@ -70,7 +68,19 @@ class FeatureContext:
     @property
     def Is(self) -> np.ndarray:
         if "Is" not in self._cache:
-            self._cache["Is"] = rgb_to_hsv(self.image_rgb.astype(np.float32) / 255.0)[:, :, 1]
+            # Keep the original float32 normalization and rounding, but compute
+            # only saturation: hue and value are not used by any FADE feature.
+            rgb = self.image_rgb.astype(np.float32) / 255.0
+            maximum = rgb.max(axis=2)
+            minimum = rgb.min(axis=2)
+            if np.any(maximum > 1) or np.any(minimum < 0):
+                raise ValueError("Input array must be in the range [0, 255].")
+            self._cache["Is"] = np.divide(
+                maximum - minimum,
+                maximum,
+                out=np.zeros_like(maximum),
+                where=maximum > 0,
+            )
         return self._cache["Is"]
 
     @property
@@ -119,7 +129,9 @@ class FeatureContext:
     @property
     def CE_gray(self) -> np.ndarray:
         if "CE_gray" not in self._cache:
-            ce_gray, ce_by, ce_rg = compute_ce(self.image_rgb)
+            # CE uses unrounded gray with 0.299, unlike the MSCN/entropy gray.
+            gray = 0.299 * self.R + 0.587 * self.G + 0.114 * self.B
+            ce_gray, ce_by, ce_rg = compute_ce_from_channels(gray, self.by, self.rg)
             self._cache["CE_gray"] = ce_gray
             self._cache["CE_by"] = ce_by
             self._cache["CE_rg"] = ce_rg

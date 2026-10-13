@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
 
 from fade.features.registry import (
     canonical_feature_registry,
     default_feature_registry,
-    migrated_feature_registry,
 )
 
 
@@ -46,20 +44,12 @@ class TestCanonicalFeatureRegistry:
         assert len(names) == len(set(names))
 
 
-class TestDefaultAndMigratedRegistry:
+class TestDefaultRegistry:
 
     def test_default_returns_12(self):
         assert len(default_feature_registry()) == 12
-
-    def test_migrated_returns_12(self):
-        assert len(migrated_feature_registry()) == 12
 
     def test_default_same_names_as_canonical(self):
         canonical_names = [f.name for f in canonical_feature_registry()]
         default_names = [f.name for f in default_feature_registry()]
         assert canonical_names == default_names
-
-    def test_migrated_same_names_as_canonical(self):
-        canonical_names = [f.name for f in canonical_feature_registry()]
-        migrated_names = [f.name for f in migrated_feature_registry()]
-        assert canonical_names == migrated_names

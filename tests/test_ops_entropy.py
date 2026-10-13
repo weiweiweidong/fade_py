@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
+from scipy.stats import entropy
 
 from fade.ops.entropy import patch_entropy
 
@@ -82,3 +82,19 @@ class TestPatchEntropy:
         r1 = patch_entropy(img, 4, 4, 8)
         r2 = patch_entropy(img, 4, 4, 8)
         np.testing.assert_array_equal(r1, r2)
+
+    def test_large_grid_matches_independent_entropy_at_batch_boundaries(self):
+        rng = np.random.default_rng(7)
+        rows, cols = 70, 65
+        for ps in (4, 8):
+            image = rng.integers(0, 256, (rows * ps + 1, cols * ps + 3), dtype=np.int32)
+            actual = patch_entropy(image, rows, cols, ps)
+            for index in (0, 4095, 4096, 4097, rows * cols - 1):
+                row, col = divmod(index, cols)
+                patch = image[row * ps : (row + 1) * ps, col * ps : (col + 1) * ps]
+                _, counts = np.unique(patch, return_counts=True)
+                np.testing.assert_allclose(actual[row, col], entropy(counts, base=2), atol=1e-12)
+
+    def test_empty_patch_grid(self):
+        actual = patch_entropy(np.empty((0, 16), dtype=np.int32), 0, 2, 8)
+        assert actual.shape == (0, 2)

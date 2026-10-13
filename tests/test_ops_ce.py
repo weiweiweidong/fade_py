@@ -1,16 +1,15 @@
-"""Tests for fade/ce.py — LoG filter, padding helpers, and compute_ce."""
+"""Tests for ops/ce.py — LoG filter, padding helpers, and compute_ce."""
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-from fade.ce import (
+from fade.ops.ce import (
     _build_log_filter,
-    _contrast_energy,
     _pad_border,
     _unpad_border,
     compute_ce,
+    compute_ce_from_channels,
 )
 
 
@@ -132,3 +131,13 @@ class TestComputeCe:
         assert len(result) == 3
         for arr in result:
             assert not np.any(np.isnan(arr))
+
+    def test_prepared_channels_match_rgb_and_remain_unchanged(self, standard_rgb):
+        r, g, b = standard_rgb.astype(np.float64).transpose(2, 0, 1)
+        channels = (0.299 * r + 0.587 * g + 0.114 * b, 0.5 * (r + g) - b, r - g)
+        original = [channel.copy() for channel in channels]
+        expected = compute_ce(standard_rgb)
+        actual = compute_ce_from_channels(*channels)
+        for result, reference, channel, before in zip(actual, expected, channels, original):
+            np.testing.assert_array_equal(result, reference)
+            np.testing.assert_array_equal(channel, before)

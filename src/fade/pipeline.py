@@ -50,7 +50,8 @@ class FadePipeline:
         if not feature_maps:
             return np.empty((0, 0), dtype=np.float64)
         flattened = [feature_map.ravel() for feature_map in feature_maps]
-        return np.log1p(np.column_stack(flattened))
+        feat = np.column_stack(flattened).astype(np.float64, copy=False)
+        return np.log1p(feat, out=feat)
 
     def run(self, image: np.ndarray) -> Tuple[float, np.ndarray]:
         """
@@ -70,10 +71,10 @@ class FadePipeline:
         patch_var = np.nanvar(feat, axis=1, ddof=1)
 
         fogfree, foggy = load_reference_stats()
-        mu_free = np.ravel(fogfree["mu_fogfreeparam"]).astype(np.float64)
-        cov_free = fogfree["cov_fogfreeparam"].astype(np.float64)
-        mu_foggy = np.ravel(foggy["mu_foggyparam"]).astype(np.float64)
-        cov_foggy = foggy["cov_foggyparam"].astype(np.float64)
+        mu_free = np.ravel(fogfree["mu_fogfreeparam"]).astype(np.float64, copy=False)
+        cov_free = fogfree["cov_fogfreeparam"].astype(np.float64, copy=False)
+        mu_foggy = np.ravel(foggy["mu_foggyparam"]).astype(np.float64, copy=False)
+        cov_foggy = foggy["cov_foggyparam"].astype(np.float64, copy=False)
 
         mu_diff_free = mu_free[np.newaxis, :] - feat
         dist_free = batch_mahalanobis(mu_diff_free, patch_var, cov_free)

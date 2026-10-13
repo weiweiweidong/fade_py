@@ -22,7 +22,7 @@ FADE estimates fog density from a **single RGB image** using 12 handcrafted perc
 - **12-feature FADE pipeline** — faithful reproduction of the original algorithm
 - **Modular architecture** — `features`, `ops`, `models`, `pipeline` sub-packages
 - **Simple public API** — `fade(image)` and `fade_with_map(image)`
-- **256-test suite** — pytest coverage across all modules
+- **pytest test suite** — pytest coverage across all modules
 
 ---
 
@@ -38,14 +38,14 @@ This project is managed with [uv](https://github.com/astral-sh/uv). Using `uv` i
 # Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create virtual environment and install all dependencies
+# Create virtual environment and install the algorithm dependencies
 uv sync
 
-# Install with test dependencies
-uv sync --extra test
+# Install image-loading, plotting, and notebook dependencies
+uv sync --extra demo
 
-# Install fade in editable mode so it can be imported in the environment
-uv pip install -e .
+# Install both demo and test dependencies
+uv sync --extra demo --extra test
 
 # Run any command inside the managed environment
 uv run python -c "from fade import fade; print('OK')"
@@ -57,8 +57,7 @@ uv run python -c "from fade import fade; print('OK')"
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 
-pip install numpy scipy matplotlib pillow
-pip install -e .
+pip install -e ".[demo]"
 ```
 
 ---
@@ -98,10 +97,9 @@ fade_py/
 │   │   └── f01.py ~ f12.py
 │   ├── ops/              # Low-level operators (MSCN, entropy, patches, …)
 │   ├── models/           # Context model + reference statistics loader
-│   ├── data/             # Pre-computed reference .mat files
-│   └── fade.py           # Legacy baseline implementation
-├── tests/                # pytest suite (256 tests)
-├── reference/            # Original paper (FADE.pdf) and archive
+│   └── data/             # Pre-computed reference .mat files
+├── tests/                # pytest suite
+├── reference/            # Original paper (FADE.pdf)
 ├── test_image/           # Sample images
 ├── test_fade.ipynb       # Interactive demo notebook
 └── pyproject.toml
@@ -114,13 +112,14 @@ fade_py/
 With `uv`:
 
 ```bash
-uv run pytest
-uv run pytest -m "not slow"   # skip slow image-loading tests
+uv run --extra test pytest
+uv run --extra test pytest -m "not slow"   # skip slow image-loading tests
 ```
 
 With standard `pytest`:
 
 ```bash
+pip install -e ".[test]"
 pytest
 pytest -m "not slow"
 ```
@@ -130,6 +129,7 @@ pytest -m "not slow"
 ## Demo Notebook
 
 Open `test_fade.ipynb` to compute FADE scores for sample images interactively.
+Install the `demo` extra first (`uv sync --extra demo` or `pip install -e ".[demo]"`).
 
 Each row in the output shows:
 
@@ -147,13 +147,14 @@ Each row in the output shows:
 - Input must be an RGB `np.ndarray` with shape `(H, W, 3)` and dtype `uint8`.
 - The pipeline operates on non-overlapping `8×8` patches.
 - Reference statistics are loaded from `.mat` files in `src/fade/data/`.
+- The algorithm requires only NumPy and SciPy. Image loading, plotting, and notebook tools are optional `demo` dependencies.
+- Entropy histograms and covariance solves run in batches of at most 4096 patches to bound temporary memory.
 
 ---
 
 ## Reference Assets
 
 - `reference/FADE.pdf` — original paper
-- `reference/FADE_py-main.zip` — previous Python implementation archive
 
 ---
 

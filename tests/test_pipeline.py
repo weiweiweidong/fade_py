@@ -109,6 +109,15 @@ class TestBuildFeatureMatrix:
         feat = pipeline.build_feature_matrix(maps)
         assert feat.dtype == np.float64
 
+    def test_feature_matrix_transform_does_not_mutate_maps(self, pipeline):
+        maps = [np.arange(6, dtype=np.float64).reshape(2, 3), np.ones((2, 3))]
+        before = [feature_map.copy() for feature_map in maps]
+        actual = pipeline.build_feature_matrix(maps)
+        expected = np.column_stack([np.log1p(feature_map.ravel()) for feature_map in before])
+        np.testing.assert_array_equal(actual, expected)
+        for feature_map, original in zip(maps, before):
+            np.testing.assert_array_equal(feature_map, original)
+
 
 # ---------------------------------------------------------------------------
 # run

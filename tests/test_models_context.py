@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from fade.models.context import FeatureContext
 
@@ -115,6 +114,17 @@ class TestColorChannels:
     def test_uniform_Is_is_zero(self, uniform_context):
         """Gray image has no saturation."""
         np.testing.assert_allclose(uniform_context.Is, 0.0, atol=1e-6)
+
+    def test_saturation_black_gray_and_primary_colors(self):
+        image = np.tile(np.array([
+            [0, 0, 0], [128, 128, 128], [255, 255, 255],
+            [255, 0, 0], [0, 255, 0], [0, 0, 255],
+            [255, 255, 0], [50, 100, 150],
+        ], dtype=np.uint8), (8, 1, 1))
+        actual = FeatureContext(image).Is
+        expected = np.tile([0, 0, 0, 1, 1, 1, 1, 2 / 3], (8, 1))
+        np.testing.assert_allclose(actual, expected, atol=1e-7)
+        assert actual.dtype == np.float32
 
 
 # ---------------------------------------------------------------------------

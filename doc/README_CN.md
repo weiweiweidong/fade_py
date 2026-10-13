@@ -22,7 +22,7 @@ FADE 仅凭**单张 RGB 图像**，通过 12 个手工感知特征与预计算�
 - **完整 12 特征 FADE 流水线** — 忠实复现原始算法
 - **模块化架构** — `features`、`ops`、`models`、`pipeline` 子包
 - **简洁公共 API** — `fade(image)` 与 `fade_with_map(image)`
-- **256 个测试用例** — 覆盖所有模块的 pytest 测试套件
+- **完整测试套件** — 覆盖所有模块的 pytest 测试套件
 
 ---
 
@@ -38,14 +38,14 @@ FADE 仅凭**单张 RGB 图像**，通过 12 个手工感知特征与预计算�
 # 若尚未安装 uv，先执行安装
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 创建虚拟环境并安装所有依赖
+# 创建虚拟环境并安装算法依赖
 uv sync
 
-# 同时安装测试依赖
-uv sync --extra test
+# 安装图像读取、绘图和 Notebook 依赖
+uv sync --extra demo
 
-# 以可编辑模式安装 fade，使其可在环境中被导入
-uv pip install -e .
+# 同时安装演示与测试依赖
+uv sync --extra demo --extra test
 
 # 在托管环境中运行命令
 uv run python -c "from fade import fade; print('OK')"
@@ -57,8 +57,7 @@ uv run python -c "from fade import fade; print('OK')"
 python -m venv .venv
 source .venv/bin/activate      # Windows：.venv\Scripts\activate
 
-pip install numpy scipy matplotlib pillow
-pip install -e .
+pip install -e ".[demo]"
 ```
 
 ---
@@ -98,10 +97,9 @@ fade_py/
 │   │   └── f01.py ~ f12.py
 │   ├── ops/              # 底层算子（MSCN、熵、patch 划分等）
 │   ├── models/           # 上下文模型 + 参考统计量加载器
-│   ├── data/             # 预计算参考 .mat 文件
-│   └── fade.py           # 遗留基线实现
-├── tests/                # pytest 测试套件（256 个测试）
-├── reference/            # 原始论文（FADE.pdf）及归档文件
+│   └── data/             # 预计算参考 .mat 文件
+├── tests/                # pytest 测试套件
+├── reference/            # 原始论文（FADE.pdf）
 ├── test_image/           # 示例图像
 ├── test_fade.ipynb       # 交互式演示 Notebook
 └── pyproject.toml
@@ -114,13 +112,14 @@ fade_py/
 使用 `uv`：
 
 ```bash
-uv run pytest
-uv run pytest -m "not slow"   # 跳过需要加载图像的慢速测试
+uv run --extra test pytest
+uv run --extra test pytest -m "not slow"   # 跳过需要加载图像的慢速测试
 ```
 
 使用标准 `pytest`：
 
 ```bash
+pip install -e ".[test]"
 pytest
 pytest -m "not slow"
 ```
@@ -130,6 +129,7 @@ pytest -m "not slow"
 ## 演示 Notebook
 
 打开 `test_fade.ipynb`，可交互式地对示例图像计算 FADE 分数。
+请先安装演示依赖：`uv sync --extra demo` 或 `pip install -e ".[demo]"`。
 
 输出表格各字段说明：
 
@@ -147,13 +147,14 @@ pytest -m "not slow"
 - 输入须为 RGB `np.ndarray`，形状为 `(H, W, 3)`，数据类型为 `uint8`。
 - 流水线在不重叠的 `8×8` patch 上进行运算。
 - 参考统计量从 `src/fade/data/` 目录下的 `.mat` 文件加载。
+- 算法运行仅依赖 NumPy 和 SciPy；图像读取、绘图与 Notebook 工具属于可选的 `demo` 依赖。
+- 图像块熵与协方差求解按最多 4096 个图像块分批处理，控制临时内存占用。
 
 ---
 
 ## 参考资源
 
 - `reference/FADE.pdf` — 原始论文
-- `reference/FADE_py-main.zip` — 历史 Python 实现归档
 
 ---
 

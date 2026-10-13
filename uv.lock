@@ -472,8 +472,6 @@ name = "fade"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -481,21 +479,29 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+demo = [
+    { name = "ipykernel" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+]
 test = [
+    { name = "pillow" },
     { name = "pytest" },
     { name = "pytest-cov" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ipykernel", specifier = ">=7.2.0" },
-    { name = "matplotlib", specifier = ">=3.9" },
+    { name = "ipykernel", marker = "extra == 'demo'", specifier = ">=7.2.0" },
+    { name = "matplotlib", marker = "extra == 'demo'", specifier = ">=3.9" },
     { name = "numpy", specifier = ">=2.0" },
+    { name = "pillow", marker = "extra == 'demo'", specifier = ">=10.0" },
+    { name = "pillow", marker = "extra == 'test'", specifier = ">=10.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0" },
     { name = "scipy", specifier = ">=1.13" },
 ]
-provides-extras = ["test"]
+provides-extras = ["demo", "test"]
 
 [[package]]
 name = "fonttools"

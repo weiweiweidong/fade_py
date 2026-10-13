@@ -24,11 +24,6 @@ def canonical_feature_registry() -> list[Feature]:
     ]
 
 
-def migrated_feature_registry() -> list[Feature]:
-    """Return features already migrated to the new architecture."""
-    return canonical_feature_registry()
-
-
 def default_feature_registry() -> list[Feature]:
     """Return default production feature set."""
-    return migrated_feature_registry()
+    return canonical_feature_registry()

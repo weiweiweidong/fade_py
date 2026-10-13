@@ -41,13 +41,6 @@ def uniform_rgb() -> np.ndarray:
     return np.full((32, 32, 3), 128, dtype=np.uint8)
 
 
-@pytest.fixture(scope="session")
-def checkerboard_rgb() -> np.ndarray:
-    """8×8 checkerboard pattern — maximises local contrast."""
-    checker = (np.indices((64, 64)).sum(axis=0) % 2).astype(np.uint8)
-    return np.stack([checker * 255] * 3, axis=-1)
-
-
 # ---------------------------------------------------------------------------
 # FeatureContext fixtures
 # ---------------------------------------------------------------------------
@@ -78,11 +71,9 @@ TEST_IMAGE_DIR = Path(__file__).parent.parent / "test_image"
 
 
 def _load_image(path: Path) -> np.ndarray:
-    import matplotlib.pyplot as plt
-    img = plt.imread(str(path))
-    if img.dtype != np.uint8:
-        img = (img * 255).clip(0, 255).astype(np.uint8)
-    return img[:, :, :3]
+    from PIL import Image
+    with Image.open(path) as image:
+        return np.array(image.convert("RGB"))
 
 
 @pytest.fixture(scope="session")

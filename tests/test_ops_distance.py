@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from fade.ops.distance import batch_mahalanobis
 
@@ -82,3 +81,26 @@ class TestBatchMahalanobis:
         d_large = batch_mahalanobis(mu, np.array([100.0]), cov)
         # With larger patch_var, batch_cov is larger, inverse is smaller → smaller distance
         assert d_large[0] < d_small[0]
+
+    def test_large_batch_matches_direct_solve(self):
+        rng = np.random.default_rng(8)
+        n, d = 5003, 12
+        matrix = rng.standard_normal((d, d))
+        cov = matrix @ matrix.T + np.eye(d)
+        mu = rng.standard_normal((n, d))
+        var = rng.random(n)
+        var[4096] = np.nan
+        mu[4097, 0] = np.nan
+        actual = batch_mahalanobis(mu, var, cov)
+        for index in (0, 4095, 4096, 4097, n - 1):
+            solution = np.linalg.solve((var[index] + cov) / 2.0, mu[index])
+            expected = np.sqrt(max(mu[index] @ solution, 0.0))
+            np.testing.assert_allclose(actual[index], expected, rtol=1e-12, equal_nan=True)
+
+    def test_float32_input_preserves_dtype(self):
+        mu = np.ones((5003, 4), dtype=np.float32)
+        var = np.ones(5003, dtype=np.float32)
+        cov = np.eye(4, dtype=np.float32)
+        actual = batch_mahalanobis(mu, var, cov)
+        assert actual.dtype == np.float32
+        np.testing.assert_allclose(actual, np.sqrt(1.6), rtol=1e-6)
